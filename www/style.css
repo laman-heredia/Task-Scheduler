@@ -1,0 +1,8 @@
+:root{font-family:system-ui,sans-serif;color:#18212f;background:#f4f6f8}
+body{margin:0}main{max-width:900px;margin:auto;padding:24px}
+header{display:flex;justify-content:space-between;align-items:center}
+section{background:#fff;margin:16px 0;padding:18px;border-radius:8px;box-shadow:0 1px 4px #0002}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th,td{text-align:left;border-bottom:1px solid #ddd;padding:9px}
+button{border:0;border-radius:4px;padding:7px 12px;background:#1769e0;color:#fff;cursor:pointer}
+code{background:#eef1f4;padding:2px 5px}
