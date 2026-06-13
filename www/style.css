@@ -6,3 +6,8 @@ table{width:100%;border-collapse:collapse;margin-top:12px}
 th,td{text-align:left;border-bottom:1px solid #ddd;padding:9px}
 button{border:0;border-radius:4px;padding:7px 12px;background:#1769e0;color:#fff;cursor:pointer}
 code{background:#eef1f4;padding:2px 5px}
+form{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+input{padding:6px;border:1px solid #bbb;border-radius:4px}
+textarea{width:100%;min-height:80px}
+.wide{flex:1 0 100%}
+pre{max-height:320px;overflow:auto;background:#111;color:#ddd;padding:12px;white-space:pre-wrap}

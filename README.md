@@ -5,6 +5,14 @@ It uses a single `epoll` event loop, `timerfd`, `signalfd`, child process
 groups, an atomic text configuration, a Unix domain control socket, and
 optional non-blocking UDP logs.
 
+The V1 web/CGI interface supports task CRUD, enable/disable, manual execution,
+bounded latest-run logs, and persistent UDP log destination settings. Both
+task and global configuration use atomic replacement, CRC32 validation, and a
+backup fallback. Local logs have per-task and global tmpfs limits.
+When the configured concurrency limit is reached, triggered tasks enter a
+fixed-capacity FIFO queue instead of polling; completion immediately releases
+the next task in trigger order.
+
 中文文档：
 
 - [使用说明](docs/使用说明.md)
@@ -50,9 +58,11 @@ step=./run-test.sh
 always_step=./cleanup.sh
 ```
 
-Normal steps are joined with `&&`. An `always_step` is joined with `;`, making
-it suitable for teardown. Commands execute with `/bin/sh -c`, matching the
-internal development and test-oriented deployment model.
+Each step runs independently through `/bin/sh -c`. After a normal step fails,
+later normal steps are skipped while every remaining `always_step` still runs.
+The first failure is retained as the task result, so a successful cleanup
+cannot hide a failed test. Shell state is not shared between steps. Background
+descendants are terminated before the scheduler advances to the next step.
 
 ## Limits
 

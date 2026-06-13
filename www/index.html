@@ -12,13 +12,37 @@
     <section>
       <h2>任务</h2>
       <button id="refresh">刷新</button>
+      <button id="new-task" type="button">新建任务</button>
       <table><thead><tr><th>ID</th><th>名称</th><th>启用</th><th>状态</th><th>轮次</th><th>操作</th></tr></thead>
       <tbody id="tasks"></tbody></table>
     </section>
     <section>
-      <h2>UDP 日志</h2>
-      <p>远程日志服务器在 <code>/etc/tsched/tsched.conf</code> 中配置。V1 页面提供状态与运行控制。</p>
+      <h2>任务编辑</h2>
+      <form id="task-form">
+        <label>ID <input id="task-id" type="number" min="1" required></label>
+        <label>名称 <input id="task-name" maxlength="63" required></label>
+        <label><input id="task-enabled" type="checkbox"> 启用</label>
+        <label>调度 <select id="task-schedule"><option value="manual">手动</option><option value="interval">循环</option></select></label>
+        <label>间隔(ms) <input id="task-interval" type="number" min="0" value="60000"></label>
+        <label>轮次 <input id="task-max-runs" type="number" min="0" value="0"></label>
+        <label>超时(ms) <input id="task-timeout" type="number" min="0" value="30000"></label>
+        <label>重试 <input id="task-retry" type="number" min="0" value="0"></label>
+        <label>目录 <input id="task-workdir" maxlength="255" value="/tmp"></label>
+        <label class="wide">命令 <textarea id="task-command" maxlength="1023" required></textarea></label>
+        <button type="submit">保存任务</button><span id="task-result"></span>
+      </form>
     </section>
+    <section>
+      <h2>UDP 日志</h2>
+      <form id="udp-form">
+        <label><input id="udp-enabled" type="checkbox"> 启用</label>
+        <label>服务器 IP/主机名 <input id="udp-host" maxlength="63" required></label>
+        <label>端口 <input id="udp-port" type="number" min="1" max="65535" required></label>
+        <button type="submit">保存</button>
+        <span id="udp-result"></span>
+      </form>
+    </section>
+    <section><h2>最近日志</h2><pre id="task-log">选择任务的“日志”操作。</pre></section>
   </main>
   <script src="app.js"></script>
 </body>

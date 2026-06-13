@@ -40,7 +40,53 @@ int main(void)
     CHECK(config.tasks[0].step_count == 2);
     CHECK(config.tasks[0].steps[1].always_run == 1);
     CHECK(!strcmp(config.socket_path, "/tmp/test.sock"));
+    CHECK(config.local_log_total_kb == 2048);
+    CHECK(tsched_config_save_tasks(&config, tasks, error, sizeof(error)) == 0);
+    config.local_log_total_kb = 1024;
+    CHECK(tsched_config_save_global(&config, global, error, sizeof(error)) == 0);
+    config.local_log_total_kb = 512;
+    CHECK(tsched_config_save_global(&config, global, error, sizeof(error)) == 0);
+    CHECK(access(tasks, F_OK) == 0);
+    tsched_config_free(&config);
+    CHECK(tsched_config_load(&config, global, tasks, error, sizeof(error)) == 0);
+    CHECK(!strcmp(config.tasks[0].name, "hello"));
+    CHECK(config.local_log_total_kb == 512);
+    tsched_config_free(&config);
+    file = fopen(global, "a");
+    CHECK(file);
+    fputs("tampered=1\n", file);
+    fclose(file);
+    CHECK(tsched_config_load(&config, global, tasks, error, sizeof(error)) == 0);
+    CHECK(config.local_log_total_kb == 1024);
+    tsched_config_free(&config);
+    file = fopen(tasks, "a");
+    CHECK(file);
+    fputs("tampered=1\n", file);
+    fclose(file);
+    CHECK(tsched_config_load(&config, global, tasks, error, sizeof(error)) == 0);
+    CHECK(!strcmp(config.tasks[0].name, "hello"));
+    tsched_config_free(&config);
+    file = fopen(tasks, "w");
+    CHECK(file);
+    fputs("[task:7]\nname=bad\nenabled=maybe\nschedule=interval\n"
+          "interval_ms=0\nstep=echo bad\n", file);
+    fclose(file);
+    CHECK(tsched_config_load(&config, global, tasks, error, sizeof(error)) == 0);
+    CHECK(!strcmp(config.tasks[0].name, "hello"));
+    tsched_config_free(&config);
+    {
+        char backup[sizeof(tasks) + 4];
+        snprintf(backup, sizeof(backup), "%s.bak", tasks);
+        unlink(backup);
+    }
+    CHECK(tsched_config_load(&config, global, tasks, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "invalid value for enabled") != NULL);
     unlink(global);
     unlink(tasks);
+    {
+        char backup[sizeof(global) + 4];
+        snprintf(backup, sizeof(backup), "%s.bak", global);
+        unlink(backup);
+    }
     return 0;
 }

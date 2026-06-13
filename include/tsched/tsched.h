@@ -9,8 +9,8 @@
 /*
  * TSched 公共数据结构和模块接口。
  *
- * 项目面向存储资源有限的 OpenWrt 设备，因此所有核心集合都使用明确的
- * 编译期上限，避免任务配置错误导致守护进程无限制分配内存。
+ * 项目面向存储资源有限的 OpenWrt 设备，因此核心集合采用按需分配并设置
+ * 明确的编译期上限，避免空配置浪费内存或错误配置无限制扩容。
  */
 #define TSCHED_MAX_TASKS 256
 #define TSCHED_MAX_STEPS 16
@@ -18,7 +18,10 @@
 #define TSCHED_COMMAND_LEN 1024
 #define TSCHED_PATH_LEN 256
 #define TSCHED_MAX_CLIENTS 16
+#define TSCHED_IPC_REQUEST_LEN 2048
+#define TSCHED_IPC_RESPONSE_LEN 49152
 #define TSCHED_CONFIG_VERSION 1
+#define TSCHED_LOG_PATH_LEN 320
 
 enum tsched_schedule_type {
     /* 仅通过 CLI、CGI 或其他本地控制端触发。 */
@@ -32,12 +35,21 @@ enum tsched_task_state {
     TSCHED_DISABLED = 0,
     TSCHED_WAITING,
     TSCHED_RUNNING,
-    TSCHED_RETRY_WAIT
+    TSCHED_RETRY_WAIT,
+    /* 已到期或被手动触发，正在等待并发执行名额。 */
+    TSCHED_PENDING
+};
+
+enum tsched_stop_reason {
+    TSCHED_STOP_NONE = 0,
+    TSCHED_STOP_CANCEL,
+    TSCHED_STOP_TIMEOUT,
+    TSCHED_STOP_SHUTDOWN
 };
 
 struct tsched_step {
-    /* V1 中命令统一交给 /bin/sh -c 执行。 */
-    char command[TSCHED_COMMAND_LEN];
+    /* 每个步骤独立交给 /bin/sh -c 执行。 */
+    char *command;
     /* 非零表示前面步骤失败后仍应执行，通常用于 teardown。 */
     int always_run;
 };
@@ -58,12 +70,35 @@ struct tsched_task {
     /* 运行期字段：只存在于内存中，设备重启后重新初始化。 */
     uint32_t retries_done;
     enum tsched_task_state state;
+    /* leader_pid 用于 waitpid；process_group 在后代清理完成前保持有效。 */
     pid_t pid;
+    pid_t process_group;
     uint64_t started_ms;
     int output_fd;
+    int exit_pending;
+    int exit_status;
+    int terminating;
+    enum tsched_stop_reason stop_reason;
+    int group_draining;
+    uint64_t terminate_at_ms;
+    /* 逐步骤执行状态；next_step 指向下一条待判断的步骤。 */
+    size_t next_step;
+    size_t active_step;
+    int run_failed;
+    int run_exit_code;
     char workdir[TSCHED_PATH_LEN];
-    struct tsched_step steps[TSCHED_MAX_STEPS];
+    struct tsched_step *steps;
     size_t step_count;
+    size_t step_capacity;
+    int in_heap;
+    int in_pending;
+    uint32_t last_run_id;
+    int last_exit_code;
+    int last_success;
+    int log_fd;
+    size_t log_bytes;
+    int log_truncated;
+    char last_log_path[TSCHED_LOG_PATH_LEN];
 };
 
 struct tsched_config {
@@ -76,10 +111,14 @@ struct tsched_config {
     int udp_enabled;
     uint32_t max_running;
     uint32_t startup_jitter_ms;
+    uint32_t local_log_kb;
+    /* 所有本地任务日志的总上限；0 表示禁用本地日志。 */
+    uint32_t local_log_total_kb;
 
-    /* 固定容量任务表，避免在运行期扩容。 */
-    struct tsched_task tasks[TSCHED_MAX_TASKS];
+    /* 任务按实际数量分配，避免空配置也预留数 MiB 内存。 */
+    struct tsched_task *tasks;
     size_t task_count;
+    size_t task_capacity;
 };
 
 struct tsched_heap {
@@ -90,16 +129,20 @@ struct tsched_heap {
 
 /* 加载内置默认配置，不访问文件系统。 */
 void tsched_config_defaults(struct tsched_config *config);
+void tsched_config_free(struct tsched_config *config);
 /* 依次加载全局配置和任务配置，失败时将原因写入 error。 */
 int tsched_config_load(struct tsched_config *config, const char *global_path,
                        const char *task_path, char *error, size_t error_size);
 /* 通过“临时文件 + fsync + rename”方式原子保存任务配置。 */
 int tsched_config_save_tasks(const struct tsched_config *config,
                              const char *path, char *error, size_t error_size);
+int tsched_config_save_global(const struct tsched_config *config,
+                              const char *path, char *error, size_t error_size);
 
 /* 最小堆操作，插入和弹出复杂度均为 O(log N)。 */
 void tsched_heap_init(struct tsched_heap *heap);
 int tsched_heap_push(struct tsched_heap *heap, struct tsched_task *task);
+int tsched_heap_remove(struct tsched_heap *heap, struct tsched_task *task);
 struct tsched_task *tsched_heap_peek(const struct tsched_heap *heap);
 struct tsched_task *tsched_heap_pop(struct tsched_heap *heap);
 

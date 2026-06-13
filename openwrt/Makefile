@@ -3,6 +3,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=tsched
 PKG_VERSION:=0.1.0
 PKG_RELEASE:=1
+PKG_INSTALL:=1
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
@@ -12,6 +13,11 @@ define Package/tsched
   CATEGORY:=Utilities
   TITLE:=Lightweight task scheduler
   DEPENDS:=+libc
+endef
+
+define Package/tsched/conffiles
+/etc/tsched/tsched.conf
+/etc/tsched/tasks.conf
 endef
 
 define Package/tsched-web

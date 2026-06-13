@@ -22,9 +22,10 @@ int main(void)
     CHECK(tsched_heap_push(&heap, &tasks[1]) == 0);
     CHECK(tsched_heap_push(&heap, &tasks[2]) == 0);
     CHECK(tsched_heap_push(&heap, &tasks[3]) == 0);
+    CHECK(tsched_heap_push(&heap, &tasks[3]) == -1);
+    CHECK(tsched_heap_remove(&heap, &tasks[2]) == 0);
     CHECK(tsched_heap_pop(&heap)->next_run_ms == 10);
     CHECK(tsched_heap_pop(&heap)->next_run_ms == 20);
-    CHECK(tsched_heap_pop(&heap)->next_run_ms == 30);
     CHECK(tsched_heap_pop(&heap)->next_run_ms == 40);
     CHECK(tsched_heap_pop(&heap) == 0);
     return 0;
