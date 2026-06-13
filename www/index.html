@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TSched</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header><h1>TSched</h1><span id="status">正在连接…</span></header>
+    <section>
+      <h2>任务</h2>
+      <button id="refresh">刷新</button>
+      <table><thead><tr><th>ID</th><th>名称</th><th>启用</th><th>状态</th><th>轮次</th><th>操作</th></tr></thead>
+      <tbody id="tasks"></tbody></table>
+    </section>
+    <section>
+      <h2>UDP 日志</h2>
+      <p>远程日志服务器在 <code>/etc/tsched/tsched.conf</code> 中配置。V1 页面提供状态与运行控制。</p>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
