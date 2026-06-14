@@ -67,6 +67,20 @@ static int parse_bool(const char *value, int *result)
     return -1;
 }
 
+static int parse_mode(const char *value, uint32_t *result)
+{
+    char *end;
+    unsigned long parsed;
+    if (!*value || *value == '-')
+        return -1;
+    errno = 0;
+    parsed = strtoul(value, &end, 8);
+    if (errno || *end || parsed > 0777U)
+        return -1;
+    *result = (uint32_t)parsed;
+    return 0;
+}
+
 static uint32_t crc32_update(uint32_t crc, const unsigned char *data, size_t size)
 {
     size_t i;
@@ -142,8 +156,12 @@ void tsched_config_defaults(struct tsched_config *config)
                      "/tmp/tsched/logs");
     config->max_running = 16;
     config->startup_jitter_ms = 5000;
+    config->kill_grace_ms = 3000;
+    config->retry_delay_ms = 1000;
     config->local_log_kb = 64;
     config->local_log_total_kb = 2048;
+    config->socket_mode = 0660;
+    config->mirror_output = 0;
 }
 
 void tsched_config_free(struct tsched_config *config)
@@ -220,11 +238,23 @@ static int load_global(struct tsched_config *config, const char *path,
         } else if (!strcmp(key, "startup_jitter_ms")) {
             if (parse_u32(value, UINT32_MAX, &config->startup_jitter_ms))
                 goto invalid;
+        } else if (!strcmp(key, "kill_grace_ms")) {
+            if (parse_u32(value, 600000U, &config->kill_grace_ms))
+                goto invalid;
+        } else if (!strcmp(key, "retry_delay_ms")) {
+            if (parse_u32(value, UINT32_MAX, &config->retry_delay_ms))
+                goto invalid;
         } else if (!strcmp(key, "local_log_kb")) {
             if (parse_u32(value, 16384U, &config->local_log_kb))
                 goto invalid;
         } else if (!strcmp(key, "local_log_total_kb")) {
             if (parse_u32(value, 65536U, &config->local_log_total_kb))
+                goto invalid;
+        } else if (!strcmp(key, "socket_mode")) {
+            if (parse_mode(value, &config->socket_mode))
+                goto invalid;
+        } else if (!strcmp(key, "mirror_output")) {
+            if (parse_bool(value, &config->mirror_output))
                 goto invalid;
         }
         continue;
@@ -337,6 +367,8 @@ static int load_tasks(struct tsched_config *config, const char *path,
     struct tsched_task *task = NULL;
     char line[1200];
     unsigned int line_number = 0;
+    int version_seen = 0;
+    int section_seen = 0;
     if (!file) {
         snprintf(error, error_size, "%s: %s", path, strerror(errno));
         return -1;
@@ -351,6 +383,7 @@ static int load_tasks(struct tsched_config *config, const char *path,
             continue;
         if (*key == '[') {
             uint32_t id;
+            section_seen = 1;
             if (validate_task(task, path, line_number, error, error_size))
                 goto fail;
             task = NULL;
@@ -370,15 +403,39 @@ static int load_tasks(struct tsched_config *config, const char *path,
             task->id = id;
             continue;
         }
-        if (!task)
+        if (!task) {
+            uint32_t version;
+            equals = strchr(key, '=');
+            if (!equals)
+                continue;
+            *equals = '\0';
+            value = trim(equals + 1);
+            key = trim(key);
+            if (strcmp(key, "format_version"))
+                continue;
+            if (section_seen || version_seen ||
+                parse_u32(value, UINT32_MAX, &version) != 0 ||
+                version != TSCHED_CONFIG_VERSION) {
+                snprintf(error, error_size,
+                         "%s:%u: unsupported format_version", path,
+                         line_number);
+                goto fail;
+            }
+            version_seen = 1;
             continue;
+        }
         equals = strchr(key, '=');
         if (!equals)
             continue;
         *equals = '\0';
         value = trim(equals + 1);
         key = trim(key);
-        if (!strcmp(key, "name")) {
+        if (!strcmp(key, "format_version")) {
+            snprintf(error, error_size,
+                     "%s:%u: format_version must precede task sections",
+                     path, line_number);
+            goto fail;
+        } else if (!strcmp(key, "name")) {
             if (copy_value(task->name, sizeof(task->name), value))
                 goto invalid;
         } else if (!strcmp(key, "enabled")) {
@@ -493,6 +550,43 @@ static int sync_parent_directory(const char *path)
     return close(fd);
 }
 
+/*
+ * 将已经 fsync 的临时文件提交为主文件。rename(new, path) 是逻辑提交点；
+ * 如果父目录同步失败，则尽力恢复旧主文件，避免调用方回滚内存后磁盘仍保留
+ * 新配置。恢复同样同步父目录，确保返回失败时磁盘与内存保持旧状态。
+ */
+static int commit_temporary(const char *temporary, const char *path,
+                            const char *backup)
+{
+    int had_original = access(path, F_OK) == 0;
+    int saved_errno;
+    (void)unlink(backup);
+    if (had_original && rename(path, backup) != 0)
+        return -1;
+    if (rename(temporary, path) != 0) {
+        saved_errno = errno;
+        if (had_original)
+            (void)rename(backup, path);
+        errno = saved_errno;
+        return -1;
+    }
+    if (sync_parent_directory(path) == 0)
+        return 0;
+
+    saved_errno = errno;
+    if (had_original) {
+        if (rename(path, temporary) == 0 && rename(backup, path) == 0) {
+            (void)sync_parent_directory(path);
+            (void)unlink(temporary);
+        }
+    } else {
+        (void)unlink(path);
+        (void)sync_parent_directory(path);
+    }
+    errno = saved_errno;
+    return -1;
+}
+
 int tsched_config_save_tasks(const struct tsched_config *config,
                              const char *path, char *error, size_t error_size)
 {
@@ -538,16 +632,7 @@ int tsched_config_save_tasks(const struct tsched_config *config,
         goto fail;
     }
     file = NULL;
-    (void)unlink(backup);
-    if (access(path, F_OK) == 0 && rename(path, backup) != 0)
-        goto fail;
-    if (rename(temporary, path) != 0) {
-        saved_errno = errno;
-        (void)rename(backup, path);
-        errno = saved_errno;
-        goto fail;
-    }
-    if (sync_parent_directory(path) != 0)
+    if (commit_temporary(temporary, path, backup) != 0)
         goto fail;
     return 0;
 fail:
@@ -585,16 +670,21 @@ int tsched_config_save_global(const struct tsched_config *config,
             "log_dir=%s\n"
             "max_running=%u\n"
             "startup_jitter_ms=%u\n"
-            "local_log_kb=%u\n\n"
-            "local_log_total_kb=%u\n\n"
+            "kill_grace_ms=%u\n"
+            "retry_delay_ms=%u\n"
+            "local_log_kb=%u\n"
+            "local_log_total_kb=%u\n"
+            "socket_mode=%04o\n"
+            "mirror_output=%d\n\n"
             "[udp_log]\n"
             "udp_enabled=%d\n"
             "udp_host=%s\n"
             "udp_port=%u\n",
             config->socket_path, config->task_file, config->log_dir,
             config->max_running, config->startup_jitter_ms,
-            config->local_log_kb,
-            config->local_log_total_kb,
+            config->kill_grace_ms, config->retry_delay_ms,
+            config->local_log_kb, config->local_log_total_kb,
+            config->socket_mode, config->mirror_output,
             config->udp_enabled, config->udp_host, config->udp_port);
     if (ferror(file) || fflush(file) != 0 ||
         crc32_fd(fileno(file), &checksum) != 0 ||
@@ -607,16 +697,7 @@ int tsched_config_save_global(const struct tsched_config *config,
         goto fail;
     }
     file = NULL;
-    (void)unlink(backup);
-    if (access(path, F_OK) == 0 && rename(path, backup) != 0)
-        goto fail;
-    if (rename(temporary, path) != 0) {
-        saved_errno = errno;
-        (void)rename(backup, path);
-        errno = saved_errno;
-        goto fail;
-    }
-    if (sync_parent_directory(path) != 0)
+    if (commit_temporary(temporary, path, backup) != 0)
         goto fail;
     return 0;
 fail:

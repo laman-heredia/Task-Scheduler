@@ -28,7 +28,8 @@
         <label>超时(ms) <input id="task-timeout" type="number" min="0" value="30000"></label>
         <label>重试 <input id="task-retry" type="number" min="0" value="0"></label>
         <label>目录 <input id="task-workdir" maxlength="255" value="/tmp"></label>
-        <label class="wide">命令 <textarea id="task-command" maxlength="1023" required></textarea></label>
+        <label class="wide">普通步骤（每行一条命令） <textarea id="task-steps" required></textarea></label>
+        <label class="wide">清理步骤（每行一条命令，失败后仍执行） <textarea id="task-always-steps"></textarea></label>
         <button type="submit">保存任务</button><span id="task-result"></span>
       </form>
     </section>

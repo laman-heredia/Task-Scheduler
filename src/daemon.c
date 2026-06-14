@@ -33,6 +33,10 @@ struct client_connection {
     size_t used;
     uint16_t generation;
     char request[TSCHED_IPC_REQUEST_LEN];
+    char *response;
+    size_t response_length;
+    size_t response_sent;
+    uint64_t deadline_ms;
 };
 
 /*
@@ -60,6 +64,8 @@ struct daemon_state {
     size_t client_count;
     size_t log_total_bytes;
 };
+
+static void close_client(struct daemon_state *state, size_t index);
 
 static int add_event(int epoll_fd, int fd, uint32_t events, uint64_t data)
 {
@@ -156,20 +162,55 @@ static int reserve_online_tasks(struct daemon_state *state)
     return 0;
 }
 
+static uint64_t add_milliseconds(uint64_t value, uint64_t increment)
+{
+    return UINT64_MAX - value < increment ? UINT64_MAX : value + increment;
+}
+
 static void arm_timer(struct daemon_state *state)
 {
     struct itimerspec timer;
     struct tsched_task *task = tsched_heap_peek(&state->heap);
     uint64_t now = tsched_monotonic_ms();
-    uint64_t delay = task && task->next_run_ms > now ? task->next_run_ms - now : 1;
+    uint64_t deadline = task ? task->next_run_ms : UINT64_MAX;
+    size_t i;
     memset(&timer, 0, sizeof(timer));
     /*
-     * timerfd 仅跟踪堆顶任务；任务数量增加时不会产生逐任务定时器，
-     * 空闲时也不需要按固定周期扫描整个任务表。
+     * 同一个 timerfd 同时跟踪堆顶调度时间、任务超时和 TERM 宽限期。
+     * 这样主循环可以无限期 epoll_wait，毫秒级任务也不依赖固定轮询。
      */
-    if (task) {
-        timer.it_value.tv_sec = (time_t)(delay / 1000U);
-        timer.it_value.tv_nsec = (long)(delay % 1000U) * 1000000L;
+    for (i = 0; i < state->config.task_count; ++i) {
+        struct tsched_task *running = &state->config.tasks[i];
+        uint64_t candidate;
+        if (running->state != TSCHED_RUNNING)
+            continue;
+        if (running->kill_sent)
+            candidate = now + 10U;
+        else if (running->terminating || running->group_draining)
+            candidate = add_milliseconds(running->terminate_at_ms,
+                                         state->config.kill_grace_ms);
+        else if (running->timeout_ms)
+            candidate = add_milliseconds(running->started_ms,
+                                         running->timeout_ms);
+        else
+            continue;
+        if (candidate < deadline)
+            deadline = candidate;
+    }
+    for (i = 0; i < TSCHED_MAX_CLIENTS; ++i) {
+        if (state->clients[i].fd >= 0 &&
+            state->clients[i].deadline_ms < deadline)
+            deadline = state->clients[i].deadline_ms;
+    }
+    if (deadline != UINT64_MAX) {
+        uint64_t delay = deadline > now ? deadline - now : 1U;
+        if (delay / 1000U > (uint64_t)INT_MAX) {
+            timer.it_value.tv_sec = (time_t)INT_MAX;
+            timer.it_value.tv_nsec = 0;
+        } else {
+            timer.it_value.tv_sec = (time_t)(delay / 1000U);
+            timer.it_value.tv_nsec = (long)(delay % 1000U) * 1000000L;
+        }
     }
     (void)timerfd_settime(state->timer_fd, 0, &timer, NULL);
 }
@@ -180,10 +221,16 @@ static void schedule_task(struct daemon_state *state, struct tsched_task *task,
     (void)remove_pending(state, task->id);
     (void)tsched_heap_remove(&state->heap, task);
     /* 间隔和重试均基于单调时钟，系统时间跳变不会改变等待时长。 */
-    task->next_run_ms = tsched_monotonic_ms() + (delay_ms ? delay_ms : 1);
+    task->next_run_ms = add_milliseconds(tsched_monotonic_ms(),
+                                         delay_ms ? delay_ms : 1U);
     task->state = TSCHED_WAITING;
     (void)tsched_heap_push(&state->heap, task);
     arm_timer(state);
+}
+
+static int task_run_limit_reached(const struct tsched_task *task)
+{
+    return task->max_runs && task->run_count >= task->max_runs;
 }
 
 static void open_task_log(struct daemon_state *state, struct tsched_task *task)
@@ -262,14 +309,14 @@ static void log_step_event(struct daemon_state *state, struct tsched_task *task,
     char message[128];
     int length;
     if (exit_code == INT_MIN)
-        length = snprintf(message, sizeof(message), "step=%zu type=%s",
-                          index + 1U,
-                          task->steps[index].always_run ? "always" : "normal");
+        (void)snprintf(message, sizeof(message), "step=%zu type=%s",
+                       index + 1U,
+                       task->steps[index].always_run ? "always" : "normal");
     else
-        length = snprintf(message, sizeof(message),
-                          "step=%zu type=%s code=%d", index + 1U,
-                          task->steps[index].always_run ? "always" : "normal",
-                          exit_code);
+        (void)snprintf(message, sizeof(message),
+                       "step=%zu type=%s code=%d", index + 1U,
+                       task->steps[index].always_run ? "always" : "normal",
+                       exit_code);
     tsched_udp_send(state->udp_fd, &state->udp_address,
                     state->udp_address_len, task, event, message);
     if (!strcmp(event, "step_start") || !strcmp(event, "step_finish") ||
@@ -321,11 +368,31 @@ static int spawn_step(struct daemon_state *state, struct tsched_task *task,
         return -1;
     }
     if (pid == 0) {
+        sigset_t empty_mask;
+        char task_id[16];
+        char run_id[16];
+        char step_index[32];
+        /*
+         * 守护进程为 signalfd 阻塞了终止信号；fork 会继承该 mask。
+         * 执行用户命令前必须解除阻塞，否则 SIGTERM 只能等到宽限期后
+         * 依赖 SIGKILL，任务也无法运行自己的 TERM 清理处理器。
+         */
+        sigemptyset(&empty_mask);
+        (void)sigprocmask(SIG_SETMASK, &empty_mask, NULL);
         (void)setpgid(0, 0);
         close(pipe_fds[0]);
         (void)dup2(pipe_fds[1], STDOUT_FILENO);
         (void)dup2(pipe_fds[1], STDERR_FILENO);
         close(pipe_fds[1]);
+        (void)snprintf(task_id, sizeof(task_id), "%u", task->id);
+        (void)snprintf(run_id, sizeof(run_id), "%u", task->last_run_id);
+        (void)snprintf(step_index, sizeof(step_index), "%zu", index + 1U);
+        (void)setenv("TSCHED_TASK_ID", task_id, 1);
+        (void)setenv("TSCHED_TASK_NAME", task->name, 1);
+        (void)setenv("TSCHED_RUN_ID", run_id, 1);
+        (void)setenv("TSCHED_STEP_INDEX", step_index, 1);
+        (void)setenv("TSCHED_STEP_TYPE",
+                     task->steps[index].always_run ? "always" : "normal", 1);
         if (task->workdir[0] && chdir(task->workdir) != 0)
             _exit(126);
         execl("/bin/sh", "sh", "-c", task->steps[index].command, (char *)NULL);
@@ -391,7 +458,7 @@ static void run_next_step(struct daemon_state *state, struct tsched_task *task)
 static int start_task(struct daemon_state *state, struct tsched_task *task)
 {
     if (task->state == TSCHED_RUNNING || task->exit_pending ||
-        !task->step_count)
+        !task->step_count || task_run_limit_reached(task))
         return -1;
     if (state->config.max_running && state->running >= state->config.max_running)
         return -1;
@@ -407,12 +474,14 @@ static int start_task(struct daemon_state *state, struct tsched_task *task)
     task->terminating = 0;
     task->stop_reason = TSCHED_STOP_NONE;
     task->group_draining = 0;
+    task->kill_sent = 0;
     task->process_group = 0;
     open_task_log(state, task);
     ++state->running;
     tsched_udp_send(state->udp_fd, &state->udp_address,
                     state->udp_address_len, task, "start", "");
     run_next_step(state, task);
+    arm_timer(state);
     return 0;
 }
 
@@ -439,6 +508,10 @@ static void dispatch_pending(struct daemon_state *state)
         task = find_task(state, id);
         if (!task)
             continue;
+        if (task_run_limit_reached(task)) {
+            task->state = task->enabled ? TSCHED_WAITING : TSCHED_DISABLED;
+            continue;
+        }
         /*
          * 队首任务无法启动时不能阻塞后续任务。配置解析已经保证正常
          * 任务至少有一个步骤，因此这里只处理运行期异常或陈旧队列项。
@@ -466,6 +539,7 @@ static void finish_task(struct daemon_state *state, struct tsched_task *task)
     task->exit_pending = 0;
     task->terminating = 0;
     task->group_draining = 0;
+    task->kill_sent = 0;
     task->last_success = success;
     task->last_exit_code = task->run_exit_code;
     if (task->log_fd >= 0) {
@@ -495,8 +569,11 @@ static void finish_task(struct daemon_state *state, struct tsched_task *task)
         stop_reason != TSCHED_STOP_SHUTDOWN &&
         task->retries_done < task->retry_count) {
         ++task->retries_done;
+        schedule_task(state, task,
+                      state->config.retry_delay_ms ?
+                          state->config.retry_delay_ms : 1U);
+        task->state = TSCHED_RETRY_WAIT;
         task->stop_reason = TSCHED_STOP_NONE;
-        schedule_task(state, task, 1000U);
         dispatch_pending(state);
         return;
     }
@@ -555,6 +632,7 @@ static void begin_group_drain(struct tsched_task *task)
         return;
     (void)signal_task_group(task, SIGTERM);
     task->group_draining = 1;
+    task->kill_sent = 0;
     task->terminate_at_ms = tsched_monotonic_ms();
 }
 
@@ -570,6 +648,7 @@ static void maybe_complete_exited_step(struct daemon_state *state,
          * PGID，确认不存在残留进程后才允许步骤完成。
          */
         begin_group_drain(task);
+        arm_timer(state);
         return;
     }
     if (task->output_fd >= 0) {
@@ -589,8 +668,19 @@ static int drain_output(struct daemon_state *state, struct tsched_task *task)
         return 1;
     while ((count = read(task->output_fd, buffer, sizeof(buffer) - 1)) > 0) {
         buffer[count] = '\0';
-        fwrite(buffer, 1, (size_t)count, stdout);
-        fflush(stdout);
+        if (state->config.mirror_output) {
+            size_t offset = 0;
+            while (offset < (size_t)count) {
+                ssize_t written = write(STDOUT_FILENO, buffer + offset,
+                                        (size_t)count - offset);
+                if (written > 0)
+                    offset += (size_t)written;
+                else if (written < 0 && errno == EINTR)
+                    continue;
+                else
+                    break;
+            }
+        }
         write_task_log(state, task, buffer, (size_t)count);
         tsched_udp_send(state->udp_fd, &state->udp_address,
                         state->udp_address_len, task, "output", buffer);
@@ -629,23 +719,43 @@ static void check_timeouts(struct daemon_state *state)
         /* 对负 PID 发送信号，目标是该任务的整个进程组。 */
         if (task->state != TSCHED_RUNNING || task->process_group <= 1)
             continue;
+        if (task->kill_sent) {
+            if (!task_group_alive(task))
+                maybe_complete_exited_step(state, task);
+            continue;
+        }
         if (task->group_draining) {
             if (!task_group_alive(task))
                 maybe_complete_exited_step(state, task);
-            else if (now - task->terminate_at_ms >= 3000U)
-                (void)signal_task_group(task, SIGKILL);
+            else if (now - task->terminate_at_ms >=
+                     state->config.kill_grace_ms)
+                task->kill_sent =
+                    signal_task_group(task, SIGKILL) == 0 || errno == ESRCH;
         } else if (!task->terminating && !task->group_draining &&
             task->timeout_ms &&
             now - task->started_ms >= task->timeout_ms) {
             (void)signal_task_group(task, SIGTERM);
             task->terminating = 1;
             task->stop_reason = TSCHED_STOP_TIMEOUT;
+            task->kill_sent = 0;
             task->terminate_at_ms = now;
         } else if (task->terminating &&
-                   now - task->terminate_at_ms >= 3000U) {
-            (void)signal_task_group(task, SIGKILL);
+                   now - task->terminate_at_ms >=
+                       state->config.kill_grace_ms) {
+            task->kill_sent =
+                signal_task_group(task, SIGKILL) == 0 || errno == ESRCH;
         }
     }
+}
+
+static void check_client_timeouts(struct daemon_state *state)
+{
+    uint64_t now = tsched_monotonic_ms();
+    size_t index;
+    for (index = 0; index < TSCHED_MAX_CLIENTS; ++index)
+        if (state->clients[index].fd >= 0 &&
+            now >= state->clients[index].deadline_ms)
+            close_client(state, index);
 }
 
 static void handle_timer(struct daemon_state *state)
@@ -661,6 +771,10 @@ static void handle_timer(struct daemon_state *state)
         struct tsched_task *task = tsched_heap_pop(&state->heap);
         if (!task->enabled)
             continue;
+        if (task_run_limit_reached(task)) {
+            task->state = TSCHED_WAITING;
+            continue;
+        }
         if (task->state == TSCHED_RUNNING || task->exit_pending)
             continue;
         if (state->config.max_running &&
@@ -672,22 +786,43 @@ static void handle_timer(struct daemon_state *state)
         }
     }
     check_timeouts(state);
+    check_client_timeouts(state);
     arm_timer(state);
 }
 
-static void send_response(int fd, const char *response)
+static struct client_connection *find_client_fd(struct daemon_state *state,
+                                                int fd, size_t *index_out)
 {
-    size_t total = strlen(response);
-    size_t sent = 0;
-    while (sent < total) {
-        ssize_t count = send(fd, response + sent, total - sent, MSG_NOSIGNAL);
-        if (count > 0)
-            sent += (size_t)count;
-        else if (count < 0 && errno == EINTR)
-            continue;
-        else
-            break;
+    size_t index;
+    for (index = 0; index < TSCHED_MAX_CLIENTS; ++index) {
+        if (state->clients[index].fd == fd) {
+            if (index_out)
+                *index_out = index;
+            return &state->clients[index];
+        }
     }
+    return NULL;
+}
+
+static int send_response(struct daemon_state *state, int fd,
+                         const char *response)
+{
+    struct client_connection *client = find_client_fd(state, fd, NULL);
+    size_t length;
+    char *copy;
+    if (!client || client->response)
+        return -1;
+    length = strlen(response);
+    copy = malloc(length + 1U);
+    if (!copy)
+        return -1;
+    memcpy(copy, response, length + 1U);
+    client->response = copy;
+    client->response_length = length;
+    client->response_sent = 0;
+    client->deadline_ms = add_milliseconds(tsched_monotonic_ms(), 5000U);
+    arm_timer(state);
+    return 0;
 }
 
 static void reopen_udp_log(struct daemon_state *state)
@@ -708,9 +843,10 @@ static void rebuild_heap(struct daemon_state *state)
         task->in_heap = 0;
         if (task->enabled && task->schedule == TSCHED_INTERVAL &&
             task->state != TSCHED_RUNNING &&
-            task->state != TSCHED_PENDING && !task->exit_pending) {
+            task->state != TSCHED_PENDING && !task->exit_pending &&
+            !task_run_limit_reached(task)) {
             if (task->next_run_ms <= now)
-                task->next_run_ms = now + task->interval_ms;
+                task->next_run_ms = add_milliseconds(now, task->interval_ms);
             task->state = TSCHED_WAITING;
             (void)tsched_heap_push(&state->heap, task);
         }
@@ -747,17 +883,78 @@ static int contains_protocol_delimiter(const char *value)
     return strpbrk(value, "\t\r\n") != NULL;
 }
 
+static int store_task(struct daemon_state *state, uint32_t id,
+                      const char *name, int enabled,
+                      enum tsched_schedule_type schedule, uint64_t interval,
+                      uint32_t max_runs, uint32_t timeout, uint32_t retry,
+                      const char *workdir, struct tsched_step *new_steps,
+                      size_t step_count)
+{
+    struct tsched_task *task = find_task(state, id);
+    struct tsched_task old_task;
+    struct tsched_task candidate;
+    int existed = task != NULL;
+    size_t i;
+    if (task && (task->state == TSCHED_RUNNING ||
+                 task->state == TSCHED_PENDING || task->exit_pending))
+        return -2;
+    if (!task) {
+        if (state->config.task_count >= state->config.task_capacity)
+            return -1;
+        task = &state->config.tasks[state->config.task_count];
+        memset(&old_task, 0, sizeof(old_task));
+        ++state->config.task_count;
+    } else {
+        (void)tsched_heap_remove(&state->heap, task);
+        old_task = *task;
+    }
+    candidate = existed ? old_task : (struct tsched_task){0};
+    candidate.id = id;
+    candidate.output_fd = -1;
+    candidate.log_fd = -1;
+    candidate.in_heap = 0;
+    candidate.in_pending = 0;
+    candidate.steps = new_steps;
+    candidate.step_count = candidate.step_capacity = step_count;
+    snprintf(candidate.name, sizeof(candidate.name), "%s", name);
+    snprintf(candidate.workdir, sizeof(candidate.workdir), "%s", workdir);
+    candidate.enabled = enabled;
+    candidate.schedule = schedule;
+    candidate.interval_ms = interval;
+    candidate.max_runs = max_runs;
+    candidate.timeout_ms = timeout;
+    candidate.retry_count = retry;
+    candidate.state = candidate.enabled ? TSCHED_WAITING : TSCHED_DISABLED;
+    candidate.next_run_ms = add_milliseconds(tsched_monotonic_ms(),
+                                              candidate.interval_ms);
+    *task = candidate;
+    rebuild_heap(state);
+    if (save_tasks(state) != 0) {
+        if (existed)
+            *task = old_task;
+        else {
+            memset(task, 0, sizeof(*task));
+            --state->config.task_count;
+        }
+        rebuild_heap(state);
+        return -1;
+    }
+    if (existed) {
+        for (i = 0; i < old_task.step_count; ++i)
+            free(old_task.steps[i].command);
+        free(old_task.steps);
+    }
+    return 0;
+}
+
 static int upsert_task(struct daemon_state *state, char *payload)
 {
     char *fields[10];
     char *cursor = payload;
     char *save = NULL;
-    struct tsched_task *task;
-    struct tsched_task old_task;
-    struct tsched_task candidate;
     struct tsched_step *new_steps;
     char *new_command;
-    int existed;
+    int result;
     unsigned long id, enabled, interval, max_runs, timeout, retry;
     size_t i;
     for (i = 0; i < 10; ++i) {
@@ -790,75 +987,105 @@ static int upsert_task(struct daemon_state *state, char *payload)
         return -1;
     }
     new_steps[0].command = new_command;
-    task = find_task(state, (uint32_t)id);
-    existed = task != NULL;
-    if (task && (task->state == TSCHED_RUNNING ||
-                 task->state == TSCHED_PENDING || task->exit_pending)) {
-        free(new_command);
-        free(new_steps);
-        return -2;
-    }
-    /*
-     * 当前 UPSERT 只能携带一条命令。拒绝覆盖多步骤任务，避免 Web
-     * 修改元数据时静默删除其余普通步骤和 always_step。
-     */
-    if (task && task->step_count > 1U) {
-        free(new_command);
-        free(new_steps);
-        return -3;
-    }
-    if (!task) {
-        if (state->config.task_count >= state->config.task_capacity) {
+    {
+        struct tsched_task *existing = find_task(state, (uint32_t)id);
+        if (existing && existing->step_count > 1U) {
             free(new_command);
             free(new_steps);
-            return -1;
+            return -3;
         }
-        task = &state->config.tasks[state->config.task_count];
-        memset(&old_task, 0, sizeof(old_task));
-        ++state->config.task_count;
-    } else {
-        (void)tsched_heap_remove(&state->heap, task);
-        old_task = *task;
     }
-    candidate = existed ? old_task : (struct tsched_task){0};
-    candidate.id = (uint32_t)id;
-    candidate.output_fd = -1;
-    candidate.log_fd = -1;
-    candidate.in_heap = 0;
-    candidate.in_pending = 0;
-    candidate.steps = new_steps;
-    candidate.step_count = candidate.step_capacity = 1;
-    snprintf(candidate.name, sizeof(candidate.name), "%s", fields[1]);
-    snprintf(candidate.workdir, sizeof(candidate.workdir), "%s", fields[8]);
-    candidate.enabled = (int)enabled;
-    candidate.schedule = !strcmp(fields[3], "interval") ?
-                         TSCHED_INTERVAL : TSCHED_MANUAL;
-    candidate.interval_ms = interval;
-    candidate.max_runs = (uint32_t)max_runs;
-    candidate.timeout_ms = (uint32_t)timeout;
-    candidate.retry_count = (uint32_t)retry;
-    candidate.state = candidate.enabled ? TSCHED_WAITING : TSCHED_DISABLED;
-    candidate.next_run_ms = tsched_monotonic_ms() + candidate.interval_ms;
-    *task = candidate;
-    rebuild_heap(state);
-    if (save_tasks(state) != 0) {
+    result = store_task(state, (uint32_t)id, fields[1], (int)enabled,
+                        !strcmp(fields[3], "interval") ?
+                            TSCHED_INTERVAL : TSCHED_MANUAL,
+                        interval, (uint32_t)max_runs, (uint32_t)timeout,
+                        (uint32_t)retry, fields[8], new_steps, 1U);
+    if (result != 0) {
         free(new_command);
         free(new_steps);
-        if (existed)
-            *task = old_task;
-        else {
-            memset(task, 0, sizeof(*task));
-            --state->config.task_count;
-        }
-        rebuild_heap(state);
-        return -1;
-    }
-    if (existed) {
-        for (i = 0; i < old_task.step_count; ++i)
-            free(old_task.steps[i].command);
-        free(old_task.steps);
+        return result;
     }
     return 0;
+}
+
+static int append_blob_steps(char *blob, int always_run,
+                             struct tsched_step *steps, size_t *count)
+{
+    char *cursor = blob;
+    while (cursor && *cursor) {
+        char *separator = strchr(cursor, '\x1e');
+        size_t length;
+        if (separator)
+            *separator = '\0';
+        length = strlen(cursor);
+        if (!length || length >= TSCHED_COMMAND_LEN ||
+            contains_protocol_delimiter(cursor) ||
+            *count >= TSCHED_MAX_STEPS)
+            return -1;
+        steps[*count].command = strdup(cursor);
+        if (!steps[*count].command)
+            return -1;
+        steps[*count].always_run = always_run;
+        ++*count;
+        cursor = separator ? separator + 1U : NULL;
+    }
+    return 0;
+}
+
+static int upsert_multi_task(struct daemon_state *state, char *payload)
+{
+    char *fields[11];
+    struct tsched_step *steps;
+    unsigned long id, enabled, interval, max_runs, timeout, retry;
+    enum tsched_schedule_type schedule;
+    size_t count = 0;
+    size_t i;
+    char *cursor = payload;
+    int result;
+    for (i = 0; i < 10U; ++i) {
+        char *tab = strchr(cursor, '\t');
+        if (!tab)
+            return -1;
+        *tab = '\0';
+        fields[i] = cursor;
+        cursor = tab + 1U;
+    }
+    fields[10] = cursor;
+    if (parse_ulong_field(fields[0], UINT32_MAX, &id) ||
+        parse_ulong_field(fields[2], 1U, &enabled) ||
+        parse_ulong_field(fields[4], UINT32_MAX, &interval) ||
+        parse_ulong_field(fields[5], UINT32_MAX, &max_runs) ||
+        parse_ulong_field(fields[6], UINT32_MAX, &timeout) ||
+        parse_ulong_field(fields[7], 1000U, &retry) ||
+        !fields[1][0] || strlen(fields[1]) >= TSCHED_NAME_LEN ||
+        !fields[8][0] || strlen(fields[8]) >= TSCHED_PATH_LEN ||
+        contains_protocol_delimiter(fields[1]) ||
+        contains_protocol_delimiter(fields[8]) ||
+        (strcmp(fields[3], "manual") && strcmp(fields[3], "interval")) ||
+        (!strcmp(fields[3], "interval") && !interval))
+        return -1;
+    schedule = !strcmp(fields[3], "interval") ?
+               TSCHED_INTERVAL : TSCHED_MANUAL;
+    steps = calloc(TSCHED_MAX_STEPS, sizeof(*steps));
+    if (!steps)
+        return -1;
+    if (append_blob_steps(fields[9], 0, steps, &count) != 0 ||
+        append_blob_steps(fields[10], 1, steps, &count) != 0 || !count) {
+        for (i = 0; i < count; ++i)
+            free(steps[i].command);
+        free(steps);
+        return -1;
+    }
+    result = store_task(state, (uint32_t)id, fields[1], (int)enabled,
+                        schedule, interval, (uint32_t)max_runs,
+                        (uint32_t)timeout, (uint32_t)retry, fields[8],
+                        steps, count);
+    if (result != 0) {
+        for (i = 0; i < count; ++i)
+            free(steps[i].command);
+        free(steps);
+    }
+    return result;
 }
 
 static int delete_task(struct daemon_state *state, uint32_t id)
@@ -914,37 +1141,84 @@ static int delete_task(struct daemon_state *state, uint32_t id)
     return 0;
 }
 
-static void send_task_log(int fd, const struct tsched_task *task)
+static void send_task_log(struct daemon_state *state, int fd,
+                          const struct tsched_task *task)
 {
-    char response[4096];
+    unsigned char raw[4096];
+    char response[16384];
     ssize_t count;
     int log_fd;
-    size_t used;
+    size_t used, index;
     off_t size;
     if (!task || !task->last_log_path[0]) {
-        send_response(fd, "ERR log not found\n");
+        send_response(state, fd, "ERR log not found\n");
         return;
     }
     log_fd = open(task->last_log_path, O_RDONLY | O_CLOEXEC);
     if (log_fd < 0) {
-        send_response(fd, "ERR log not found\n");
+        send_response(state, fd, "ERR log not found\n");
         return;
     }
     used = (size_t)snprintf(response, sizeof(response), "OK\n");
     size = lseek(log_fd, 0, SEEK_END);
-    if (size > (off_t)(sizeof(response) - used - 1U))
-        (void)lseek(log_fd, size - (off_t)(sizeof(response) - used - 1U),
-                    SEEK_SET);
+    if (size > (off_t)sizeof(raw))
+        (void)lseek(log_fd, size - (off_t)sizeof(raw), SEEK_SET);
     else
         (void)lseek(log_fd, 0, SEEK_SET);
-    count = read(log_fd, response + used, sizeof(response) - used - 1U);
+    count = read(log_fd, raw, sizeof(raw));
     close(log_fd);
     if (count < 0) {
-        send_response(fd, "ERR log read failed\n");
+        send_response(state, fd, "ERR log read failed\n");
         return;
     }
-    response[used + (size_t)count] = '\0';
-    send_response(fd, response);
+    /*
+     * IPC 是文本协议。保留常见空白和可打印 ASCII，其他任意字节编码
+     * 为 \\xHH，避免 NUL 截断响应或非法 UTF-8 破坏 CGI JSON。
+     */
+    for (index = 0; index < (size_t)count && used + 5U < sizeof(response);
+         ++index) {
+        unsigned char byte = raw[index];
+        if (byte == '\n' || byte == '\r' || byte == '\t' ||
+            (byte >= 0x20U && byte < 0x7fU)) {
+            response[used++] = (char)byte;
+        } else {
+            static const char hex[] = "0123456789abcdef";
+            response[used++] = '\\';
+            response[used++] = 'x';
+            response[used++] = hex[byte >> 4U];
+            response[used++] = hex[byte & 0x0fU];
+        }
+    }
+    response[used] = '\0';
+    send_response(state, fd, response);
+}
+
+static int parse_id_command(const char *command, const char *verb, uint32_t *id)
+{
+    const char *field;
+    size_t verb_length = strlen(verb);
+    unsigned long parsed;
+    if (strncmp(command, verb, verb_length) || command[verb_length] != ' ')
+        return 0;
+    field = command + verb_length + 1U;
+    if (parse_ulong_field(field, UINT32_MAX, &parsed) != 0)
+        return 0;
+    *id = (uint32_t)parsed;
+    return 1;
+}
+
+static int parse_enable_command(const char *command, uint32_t *id, int *enabled)
+{
+    char extra;
+    unsigned long task_id;
+    unsigned long value;
+    if (sscanf(command, "ENABLE %lu %lu %c",
+               &task_id, &value, &extra) != 2 ||
+        task_id > UINT32_MAX || value > 1U)
+        return 0;
+    *id = (uint32_t)task_id;
+    *enabled = (int)value;
+    return 1;
 }
 
 static void handle_command(struct daemon_state *state, int fd, char *command)
@@ -954,16 +1228,16 @@ static void handle_command(struct daemon_state *state, int fd, char *command)
      * 便于 CLI/CGI 使用，同时限制慢客户端长期占用资源。
      */
     uint32_t id;
-    if (!strncmp(command, "PING", 4)) {
-        send_response(fd, "OK pong\n");
-    } else if (!strncmp(command, "STATUS", 6)) {
+    if (!strcmp(command, "PING")) {
+        send_response(state, fd, "OK pong\n");
+    } else if (!strcmp(command, "STATUS")) {
         char response[128];
         snprintf(response, sizeof(response),
                  "OK tasks=%zu running=%u waiting=%zu queued=%zu\n",
                  state->config.task_count, state->running, state->heap.count,
                  state->pending_count);
-        send_response(fd, response);
-    } else if (!strncmp(command, "LIST", 4)) {
+        send_response(state, fd, response);
+    } else if (!strcmp(command, "LIST")) {
         char response[TSCHED_IPC_RESPONSE_LEN];
         size_t used = 0, i;
         used += (size_t)snprintf(response + used, sizeof(response) - used, "OK\n");
@@ -978,147 +1252,187 @@ static void handle_command(struct daemon_state *state, int fd, char *command)
                                          task->active_step + 1U : 0U,
                                      task->step_count);
         }
-        send_response(fd, response);
+        send_response(state, fd, response);
+    } else if (!strncmp(command, "UPSERTM\t", 8)) {
+        int result = upsert_multi_task(state, command + 8);
+        send_response(state, fd, result == 0 ? "OK saved\n" :
+                      result == -2 ? "ERR task running\n" :
+                      "ERR invalid task\n");
     } else if (!strncmp(command, "UPSERT\t", 7)) {
         int result = upsert_task(state, command + 7);
-        send_response(fd, result == 0 ? "OK saved\n" :
+        send_response(state, fd, result == 0 ? "OK saved\n" :
                       result == -2 ? "ERR task running\n" :
                       result == -3 ? "ERR multi-step task is read-only\n" :
                       "ERR invalid task\n");
-    } else if (sscanf(command, "GET %u", &id) == 1) {
+    } else if (parse_id_command(command, "GET", &id)) {
         struct tsched_task *task = find_task(state, id);
-        char response[1800];
+        char response[TSCHED_IPC_RESPONSE_LEN];
         if (!task)
-            send_response(fd, "ERR task not found\n");
+            send_response(state, fd, "ERR task not found\n");
         else {
-            snprintf(response, sizeof(response),
-                     "OK\t%u\t%s\t%d\t%s\t%llu\t%u\t%u\t%u\t%s\t%zu\t%s\n",
-                     task->id, task->name, task->enabled,
-                     task->schedule == TSCHED_INTERVAL ? "interval" : "manual",
-                     (unsigned long long)task->interval_ms, task->max_runs,
-                     task->timeout_ms, task->retry_count,
-                     task->workdir[0] ? task->workdir : "/",
-                     task->step_count,
-                     task->step_count ? task->steps[0].command : "");
-            send_response(fd, response);
-        }
-    } else if (sscanf(command, "ENABLE %u", &id) == 1) {
-        struct tsched_task *task = find_task(state, id);
-        unsigned int enabled;
-        if (!task || sscanf(command, "ENABLE %u %u", &id, &enabled) != 2 ||
-            enabled > 1U)
-            send_response(fd, "ERR invalid task\n");
-        else {
-            int old_enabled = task->enabled;
-            task->enabled = (int)enabled;
-            if (save_tasks(state) == 0) {
-                if (task->state != TSCHED_RUNNING && !task->exit_pending) {
-                    if (!enabled) {
-                        (void)remove_pending(state, task->id);
-                        (void)tsched_heap_remove(&state->heap, task);
-                        task->state = TSCHED_DISABLED;
-                        arm_timer(state);
-                    } else if (task->schedule == TSCHED_INTERVAL) {
-                        schedule_task(state, task, task->interval_ms);
-                    } else {
-                        task->state = TSCHED_WAITING;
-                    }
+            size_t used = (size_t)snprintf(
+                response, sizeof(response),
+                "OK\t%u\t%s\t%d\t%s\t%llu\t%u\t%u\t%u\t%s\t%zu\t",
+                task->id, task->name, task->enabled,
+                task->schedule == TSCHED_INTERVAL ? "interval" : "manual",
+                (unsigned long long)task->interval_ms, task->max_runs,
+                task->timeout_ms, task->retry_count,
+                task->workdir[0] ? task->workdir : "/", task->step_count);
+            size_t step;
+            for (step = 0; step < task->step_count && used < sizeof(response);
+                 ++step) {
+                int count = snprintf(response + used, sizeof(response) - used,
+                                     "%s%d:%s", step ? "\x1e" : "",
+                                     task->steps[step].always_run,
+                                     task->steps[step].command);
+                if (count < 0 || (size_t)count >= sizeof(response) - used) {
+                    used = sizeof(response);
+                    break;
                 }
-                send_response(fd, "OK saved\n");
-            } else {
-                task->enabled = old_enabled;
-                send_response(fd, "ERR save failed\n");
+                used += (size_t)count;
+            }
+            if (used + 2U > sizeof(response))
+                send_response(state, fd, "ERR task response too large\n");
+            else {
+                response[used++] = '\n';
+                response[used] = '\0';
+                send_response(state, fd, response);
             }
         }
-    } else if (sscanf(command, "DELETE %u", &id) == 1) {
-        int result = delete_task(state, id);
-        send_response(fd, result == 0 ? "OK deleted\n" :
-                      result == -2 ? "ERR task running\n" :
-                      "ERR task not found\n");
-    } else if (sscanf(command, "LOG %u", &id) == 1) {
-        send_task_log(fd, find_task(state, id));
-    } else if (!strncmp(command, "CONFIG", 6) &&
-               (command[6] == '\0' || isspace((unsigned char)command[6]))) {
-        char response[256];
-        snprintf(response, sizeof(response), "OK %d\t%s\t%u\n",
-                 state->config.udp_enabled,
-                 state->config.udp_host[0] ? state->config.udp_host : "-",
-                 state->config.udp_port);
-        send_response(fd, response);
-    } else if (!strncmp(command, "SETUDP ", 7)) {
-        unsigned int enabled, port;
-        char host[64];
-        char error[256];
-        if (sscanf(command + 7, "%u %63s %u", &enabled, host, &port) != 3 ||
-            enabled > 1U || port > 65535U || (enabled && (!host[0] || !port))) {
-            send_response(fd, "ERR invalid UDP configuration\n");
-        } else {
-            int old_enabled = state->config.udp_enabled;
-            uint16_t old_port = state->config.udp_port;
-            char old_host[sizeof(state->config.udp_host)];
-            memcpy(old_host, state->config.udp_host, sizeof(old_host));
-            state->config.udp_enabled = (int)enabled;
-            snprintf(state->config.udp_host, sizeof(state->config.udp_host),
-                     "%s", host);
-            state->config.udp_port = (uint16_t)port;
-            if (tsched_config_save_global(&state->config, state->global_path,
-                                          error, sizeof(error)) != 0) {
-                state->config.udp_enabled = old_enabled;
-                state->config.udp_port = old_port;
-                memcpy(state->config.udp_host, old_host, sizeof(old_host));
-                send_response(fd, "ERR save failed\n");
-            } else {
-                reopen_udp_log(state);
-                send_response(fd, "OK saved\n");
-            }
-        }
-    } else if (sscanf(command, "RUN %u", &id) == 1) {
-        struct tsched_task *task = find_task(state, id);
-        if (!task)
-            send_response(fd, "ERR task not found\n");
-        else if (task->state == TSCHED_RUNNING)
-            send_response(fd, "ERR task already running\n");
-        else if (task->state == TSCHED_PENDING)
-            send_response(fd, "ERR task already queued\n");
-        else {
-            (void)tsched_heap_remove(&state->heap, task);
-            arm_timer(state);
-            if (state->config.max_running &&
-                state->running >= state->config.max_running) {
-                if (enqueue_pending(state, task) == 0)
-                    send_response(fd, "OK queued\n");
-                else
-                    send_response(fd, "ERR queue full\n");
-            } else if (start_task(state, task) == 0) {
-                send_response(fd, "OK started\n");
-            } else {
-                if (task->enabled && task->schedule == TSCHED_INTERVAL)
-                    schedule_task(state, task, task->interval_ms);
-                send_response(fd, "ERR start failed\n");
-            }
-        }
-    } else if (sscanf(command, "CANCEL %u", &id) == 1) {
-        struct tsched_task *task = find_task(state, id);
-        if (task && task->state == TSCHED_PENDING) {
-            (void)remove_pending(state, task->id);
-            task->state = task->enabled ? TSCHED_WAITING : TSCHED_DISABLED;
-            send_response(fd, "OK canceled\n");
-        } else if (!task || task->state != TSCHED_RUNNING) {
-            send_response(fd, "ERR task not running\n");
-        } else {
-            if (signal_task_group(task, SIGTERM) != 0)
-                send_response(fd, "ERR task process unavailable\n");
-            else
-                send_response(fd, "OK terminating\n");
-            task->terminating = 1;
-            task->stop_reason = TSCHED_STOP_CANCEL;
-            task->terminate_at_ms = tsched_monotonic_ms();
-        }
-    } else if (!strncmp(command, "STOP", 4)) {
-        state->stopping = 1;
-        send_response(fd, "OK stopping\n");
     } else {
-        send_response(fd, "ERR unknown command\n");
+        int requested_enabled;
+        if (parse_enable_command(command, &id, &requested_enabled)) {
+            struct tsched_task *task = find_task(state, id);
+            if (!task)
+                send_response(state, fd, "ERR invalid task\n");
+            else {
+                int old_enabled = task->enabled;
+                task->enabled = requested_enabled;
+                if (save_tasks(state) == 0) {
+                    /*
+                     * 0 -> 1 明确定义为一次新的测试周期。守护进程重启本来就
+                     * 不持久化 run_count；重新启用也重置轮次，方便重复测试。
+                     */
+                    if (!old_enabled && requested_enabled) {
+                        task->run_count = 0;
+                        task->retries_done = 0;
+                    }
+                    if (task->state != TSCHED_RUNNING && !task->exit_pending) {
+                        if (!requested_enabled) {
+                            (void)remove_pending(state, task->id);
+                            (void)tsched_heap_remove(&state->heap, task);
+                            task->state = TSCHED_DISABLED;
+                            arm_timer(state);
+                        } else if (!old_enabled &&
+                                   task->schedule == TSCHED_INTERVAL) {
+                            schedule_task(state, task, task->interval_ms);
+                        } else if (!old_enabled) {
+                            task->state = TSCHED_WAITING;
+                        }
+                    }
+                    send_response(state, fd, "OK saved\n");
+                } else {
+                    task->enabled = old_enabled;
+                    send_response(state, fd, "ERR save failed\n");
+                }
+            }
+        } else if (parse_id_command(command, "DELETE", &id)) {
+            int result = delete_task(state, id);
+            send_response(state, fd, result == 0    ? "OK deleted\n"
+                              : result == -2 ? "ERR task running\n"
+                                             : "ERR task not found\n");
+        } else if (parse_id_command(command, "LOG", &id)) {
+            send_task_log(state, fd, find_task(state, id));
+        } else if (!strcmp(command, "CONFIG")) {
+            char response[256];
+            snprintf(response, sizeof(response), "OK %d\t%s\t%u\n",
+                     state->config.udp_enabled,
+                     state->config.udp_host[0] ? state->config.udp_host : "-",
+                     state->config.udp_port);
+            send_response(state, fd, response);
+        } else if (!strncmp(command, "SETUDP ", 7)) {
+            unsigned int enabled, port;
+            char host[64];
+            char extra;
+            char error[256];
+            if (sscanf(command + 7, "%u %63s %u %c", &enabled, host, &port,
+                       &extra) != 3 ||
+                enabled > 1U || port > 65535U ||
+                (enabled && (!host[0] || !port))) {
+                send_response(state, fd, "ERR invalid UDP configuration\n");
+            } else {
+                int old_enabled = state->config.udp_enabled;
+                uint16_t old_port = state->config.udp_port;
+                char old_host[sizeof(state->config.udp_host)];
+                memcpy(old_host, state->config.udp_host, sizeof(old_host));
+                state->config.udp_enabled = (int)enabled;
+                snprintf(state->config.udp_host, sizeof(state->config.udp_host),
+                         "%s", host);
+                state->config.udp_port = (uint16_t)port;
+                if (tsched_config_save_global(&state->config,
+                                              state->global_path, error,
+                                              sizeof(error)) != 0) {
+                    state->config.udp_enabled = old_enabled;
+                    state->config.udp_port = old_port;
+                    memcpy(state->config.udp_host, old_host, sizeof(old_host));
+                    send_response(state, fd, "ERR save failed\n");
+                } else {
+                    reopen_udp_log(state);
+                    send_response(state, fd, "OK saved\n");
+                }
+            }
+        } else if (parse_id_command(command, "RUN", &id)) {
+            struct tsched_task *task = find_task(state, id);
+            if (!task)
+                send_response(state, fd, "ERR task not found\n");
+            else if (task_run_limit_reached(task))
+                send_response(state, fd, "ERR max runs reached\n");
+            else if (task->state == TSCHED_RUNNING)
+                send_response(state, fd, "ERR task already running\n");
+            else if (task->state == TSCHED_PENDING)
+                send_response(state, fd, "ERR task already queued\n");
+            else {
+                (void)tsched_heap_remove(&state->heap, task);
+                arm_timer(state);
+                if (state->config.max_running &&
+                    state->running >= state->config.max_running) {
+                    if (enqueue_pending(state, task) == 0)
+                        send_response(state, fd, "OK queued\n");
+                    else
+                        send_response(state, fd, "ERR queue full\n");
+                } else if (start_task(state, task) == 0) {
+                    send_response(state, fd, "OK started\n");
+                } else {
+                    if (task->enabled && task->schedule == TSCHED_INTERVAL)
+                        schedule_task(state, task, task->interval_ms);
+                    send_response(state, fd, "ERR start failed\n");
+                }
+            }
+        } else if (parse_id_command(command, "CANCEL", &id)) {
+            struct tsched_task *task = find_task(state, id);
+            if (task && task->state == TSCHED_PENDING) {
+                (void)remove_pending(state, task->id);
+                task->state = task->enabled ? TSCHED_WAITING : TSCHED_DISABLED;
+                send_response(state, fd, "OK canceled\n");
+            } else if (!task || task->state != TSCHED_RUNNING) {
+                send_response(state, fd, "ERR task not running\n");
+            } else {
+                if (signal_task_group(task, SIGTERM) != 0)
+                    send_response(state, fd, "ERR task process unavailable\n");
+                else
+                    send_response(state, fd, "OK terminating\n");
+                task->terminating = 1;
+                task->kill_sent = 0;
+                task->stop_reason = TSCHED_STOP_CANCEL;
+                task->terminate_at_ms = tsched_monotonic_ms();
+                arm_timer(state);
+            }
+        } else if (!strcmp(command, "STOP")) {
+            state->stopping = 1;
+            send_response(state, fd, "OK stopping\n");
+        } else {
+            send_response(state, fd, "ERR unknown command\n");
+        }
     }
 }
 
@@ -1132,10 +1446,66 @@ static void close_client(struct daemon_state *state, size_t index)
         return;
     (void)epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
     close(client->fd);
+    free(client->response);
+    client->response = NULL;
+    client->response_length = 0;
+    client->response_sent = 0;
+    client->deadline_ms = 0;
     client->fd = -1;
     client->used = 0;
     if (state->client_count)
         --state->client_count;
+}
+
+static void flush_client_response(struct daemon_state *state, size_t index)
+{
+    struct client_connection *client;
+    if (index >= TSCHED_MAX_CLIENTS)
+        return;
+    client = &state->clients[index];
+    while (client->fd >= 0 && client->response &&
+           client->response_sent < client->response_length) {
+        ssize_t count = send(client->fd,
+                             client->response + client->response_sent,
+                             client->response_length - client->response_sent,
+                             MSG_NOSIGNAL);
+        if (count > 0) {
+            client->response_sent += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        close_client(state, index);
+        return;
+    }
+    if (client->fd >= 0 && client->response &&
+        client->response_sent == client->response_length)
+        close_client(state, index);
+}
+
+static void start_client_response(struct daemon_state *state, size_t index)
+{
+    struct client_connection *client;
+    struct epoll_event event;
+    if (index >= TSCHED_MAX_CLIENTS)
+        return;
+    client = &state->clients[index];
+    if (client->fd < 0 || !client->response) {
+        close_client(state, index);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLOUT | EPOLLRDHUP;
+    event.data.u64 = EVENT_CLIENT_BASE +
+                     ((uint32_t)client->generation << 16U) +
+                     (uint32_t)index;
+    if (epoll_ctl(state->epoll_fd, EPOLL_CTL_MOD, client->fd, &event) != 0) {
+        close_client(state, index);
+        return;
+    }
+    flush_client_response(state, index);
 }
 
 static void accept_clients(struct daemon_state *state)
@@ -1159,6 +1529,12 @@ static void accept_clients(struct daemon_state *state)
         }
         state->clients[index].fd = fd;
         state->clients[index].used = 0;
+        free(state->clients[index].response);
+        state->clients[index].response = NULL;
+        state->clients[index].response_length = 0;
+        state->clients[index].response_sent = 0;
+        state->clients[index].deadline_ms =
+            add_milliseconds(tsched_monotonic_ms(), 5000U);
         ++state->clients[index].generation;
         if (!state->clients[index].generation)
             ++state->clients[index].generation;
@@ -1171,6 +1547,7 @@ static void accept_clients(struct daemon_state *state)
             continue;
         }
         ++state->client_count;
+        arm_timer(state);
     }
 }
 
@@ -1189,12 +1566,21 @@ static void handle_client(struct daemon_state *state, uint32_t token,
      */
     if (client->fd < 0 || client->generation != generation)
         return;
+    if (client->response) {
+        if (events & EPOLLOUT)
+            flush_client_response(state, index);
+        else if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+            close_client(state, index);
+        return;
+    }
     while (client->used < sizeof(client->request) - 1U) {
         ssize_t count = recv(client->fd, client->request + client->used,
                              sizeof(client->request) - 1U - client->used, 0);
         if (count > 0) {
             char *newline;
             client->used += (size_t)count;
+            client->deadline_ms =
+                add_milliseconds(tsched_monotonic_ms(), 5000U);
             client->request[client->used] = '\0';
             newline = memchr(client->request, '\n', client->used);
             if (newline) {
@@ -1202,7 +1588,7 @@ static void handle_client(struct daemon_state *state, uint32_t token,
                 if (newline > client->request && newline[-1] == '\r')
                     newline[-1] = '\0';
                 handle_command(state, client->fd, client->request);
-                close_client(state, index);
+                start_client_response(state, index);
                 return;
             }
             continue;
@@ -1214,13 +1600,15 @@ static void handle_client(struct daemon_state *state, uint32_t token,
         if (count == 0 && client->used) {
             client->request[client->used] = '\0';
             handle_command(state, client->fd, client->request);
+            start_client_response(state, index);
+            return;
         }
         close_client(state, index);
         return;
     }
     if (client->used == sizeof(client->request) - 1U) {
-        send_response(client->fd, "ERR request too long\n");
-        close_client(state, index);
+        send_response(state, client->fd, "ERR request too long\n");
+        start_client_response(state, index);
         return;
     }
     if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
@@ -1285,6 +1673,8 @@ static int setup_server(struct daemon_state *state)
     if (bind(state->server_fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
         listen(state->server_fd, TSCHED_MAX_CLIENTS) != 0)
         return -1;
+    if (chmod(address.sun_path, (mode_t)state->config.socket_mode) != 0)
+        return -1;
     return add_event(state->epoll_fd, state->server_fd, EPOLLIN, EVENT_SERVER);
 }
 
@@ -1327,15 +1717,19 @@ static void initialize_schedule(struct daemon_state *state)
          * 启用的循环任务等待完整间隔，并按任务 ID 添加确定性抖动。
          */
         if (task->enabled && task->schedule == TSCHED_INTERVAL && task->interval_ms)
-            schedule_task(state, task, task->interval_ms +
-                          (state->config.startup_jitter_ms ?
-                           task->id % state->config.startup_jitter_ms : 0));
+            schedule_task(
+                state, task,
+                add_milliseconds(
+                    task->interval_ms,
+                    state->config.startup_jitter_ms ?
+                        task->id % state->config.startup_jitter_ms : 0U));
     }
 }
 
 static void shutdown_tasks(struct daemon_state *state)
 {
-    uint64_t deadline = tsched_monotonic_ms() + 3000U;
+    uint64_t deadline = add_milliseconds(tsched_monotonic_ms(),
+                                         state->config.kill_grace_ms);
     size_t i;
     for (i = 0; i < state->config.task_count; ++i) {
         struct tsched_task *task = &state->config.tasks[i];
@@ -1394,6 +1788,10 @@ int main(int argc, char **argv)
     }
     if (tsched_mkdir_p(state.config.log_dir) != 0)
         fprintf(stderr, "warning: cannot create log directory: %s\n", strerror(errno));
+    if (state.config.mirror_output &&
+        tsched_set_nonblock_cloexec(STDOUT_FILENO) != 0)
+        fprintf(stderr, "warning: cannot make stdout non-blocking: %s\n",
+                strerror(errno));
     initialize_log_usage(&state);
     if (reserve_online_tasks(&state) != 0) {
         fprintf(stderr, "cannot reserve task table\n");
@@ -1420,8 +1818,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "tschedd: loaded %zu tasks, socket %s\n",
             state.config.task_count, state.config.socket_path);
     while (!state.stopping) {
-        /* 1 秒超时只用于超时任务兜底检查；定时触发仍由 timerfd 驱动。 */
-        int count = epoll_wait(state.epoll_fd, events, 32, 1000);
+        int count = epoll_wait(state.epoll_fd, events, 32, -1);
         int i;
         if (count < 0 && errno == EINTR)
             continue;
@@ -1447,7 +1844,6 @@ int main(int argc, char **argv)
             else if ((value & EVENT_KIND_MASK) == EVENT_OUTPUT_BASE)
                 handle_output(&state, (uint32_t)(value & EVENT_VALUE_MASK));
         }
-        check_timeouts(&state);
         reap_children(&state);
     }
     shutdown_tasks(&state);

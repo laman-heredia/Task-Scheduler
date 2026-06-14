@@ -17,6 +17,18 @@ static void usage(const char *name)
             "enable ID|disable ID|delete ID|log ID|stop\n", name);
 }
 
+static int parse_task_id(const char *text, unsigned long *id)
+{
+    char *end;
+    unsigned long value;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    if (errno || !*text || *end || value > UINT32_MAX)
+        return -1;
+    *id = value;
+    return 0;
+}
+
 static int connect_socket(const char *socket_path)
 {
     struct sockaddr_un address;
@@ -118,18 +130,120 @@ static int query_value(const char *query, const char *name,
 
 static void json_escape(const char *source, char *destination, size_t size)
 {
-    /* 输出 JSON 前转义引号和反斜杠，并过滤 ASCII 控制字符。 */
+    /* 输出严格 JSON 字符串；CGI 收到的日志已经被守护进程文本化。 */
     size_t used = 0;
-    while (*source && used + 2 < size) {
+    while (*source && used + 1U < size) {
         unsigned char character = (unsigned char)*source++;
+        const char *escape = NULL;
         if (character == '"' || character == '\\') {
+            if (used + 2U >= size)
+                break;
             destination[used++] = '\\';
             destination[used++] = (char)character;
-        } else if (character >= 0x20) {
+        } else if (character == '\b') {
+            escape = "\\b";
+        } else if (character == '\f') {
+            escape = "\\f";
+        } else if (character == '\n') {
+            escape = "\\n";
+        } else if (character == '\r') {
+            escape = "\\r";
+        } else if (character == '\t') {
+            escape = "\\t";
+        } else if (character >= 0x20U && character < 0x80U) {
             destination[used++] = (char)character;
+        } else if (character >= 0x80U) {
+            const unsigned char *sequence =
+                (const unsigned char *)(source - 1U);
+            size_t length = 0;
+            int valid = 0;
+            if (character >= 0xc2U && character <= 0xdfU)
+                length = 2U;
+            else if (character >= 0xe0U && character <= 0xefU)
+                length = 3U;
+            else if (character >= 0xf0U && character <= 0xf4U)
+                length = 4U;
+            if (length && strlen((const char *)sequence) >= length) {
+                size_t index;
+                valid = 1;
+                for (index = 1; index < length; ++index)
+                    if ((sequence[index] & 0xc0U) != 0x80U)
+                        valid = 0;
+                if ((character == 0xe0U && sequence[1] < 0xa0U) ||
+                    (character == 0xedU && sequence[1] >= 0xa0U) ||
+                    (character == 0xf0U && sequence[1] < 0x90U) ||
+                    (character == 0xf4U && sequence[1] >= 0x90U))
+                    valid = 0;
+            }
+            if (valid) {
+                if (used + length >= size)
+                    break;
+                memcpy(destination + used, sequence, length);
+                used += length;
+                source += length - 1U;
+                continue;
+            }
+            {
+                static const char hex[] = "0123456789abcdef";
+                if (used + 6U >= size)
+                    break;
+                destination[used++] = '\\';
+                destination[used++] = 'u';
+                destination[used++] = '0';
+                destination[used++] = '0';
+                destination[used++] = hex[character >> 4U];
+                destination[used++] = hex[character & 0x0fU];
+            }
+        } else {
+            static const char hex[] = "0123456789abcdef";
+            if (used + 6U >= size)
+                break;
+            destination[used++] = '\\';
+            destination[used++] = 'u';
+            destination[used++] = '0';
+            destination[used++] = '0';
+            destination[used++] = hex[character >> 4U];
+            destination[used++] = hex[character & 0x0fU];
+        }
+        if (escape) {
+            if (used + 2U >= size)
+                break;
+            destination[used++] = escape[0];
+            destination[used++] = escape[1];
         }
     }
     destination[used] = '\0';
+}
+
+static int encode_step_lines(char *value)
+{
+    char *read_cursor = value;
+    char *write_cursor = value;
+    int have_step = 0;
+    while (*read_cursor) {
+        char *line = read_cursor;
+        char *end = strchr(read_cursor, '\n');
+        size_t length;
+        if (end)
+            *end = '\0';
+        length = strlen(line);
+        if (length && line[length - 1U] == '\r')
+            line[--length] = '\0';
+        if (length) {
+            if (strchr(line, '\t') || strchr(line, '\x1e'))
+                return -1;
+            if (have_step)
+                *write_cursor++ = '\x1e';
+            memmove(write_cursor, line, length);
+            write_cursor += length;
+            have_step = 1;
+        }
+        read_cursor = end ? end + 1U : line + length;
+        if (!end)
+            break;
+    }
+    *write_cursor = '\0';
+    return have_step;
 }
 
 static int cgi_main(void)
@@ -150,7 +264,9 @@ static int cgi_main(void)
     char retry[16] = "";
     char workdir[TSCHED_PATH_LEN] = "";
     char task_command[TSCHED_COMMAND_LEN] = "";
-    char command[1600];
+    char normal_steps[TSCHED_MAX_STEPS * TSCHED_COMMAND_LEN] = "";
+    char always_steps[TSCHED_MAX_STEPS * TSCHED_COMMAND_LEN] = "";
+    char command[TSCHED_IPC_REQUEST_LEN];
     char response[TSCHED_IPC_RESPONSE_LEN];
     int invalid_query = 0;
     if (!socket_path)
@@ -174,6 +290,10 @@ static int cgi_main(void)
                                  sizeof(workdir)) < 0;
     invalid_query |= query_value(query, "command", task_command,
                                  sizeof(task_command)) < 0;
+    invalid_query |= query_value(query, "steps", normal_steps,
+                                 sizeof(normal_steps)) < 0;
+    invalid_query |= query_value(query, "always_steps", always_steps,
+                                 sizeof(always_steps)) < 0;
     if (invalid_query) {
         printf("Status: 400 Bad Request\r\n"
                "Content-Type: application/json\r\n\r\n"
@@ -195,7 +315,23 @@ static int cgi_main(void)
                  strtoul(enabled, NULL, 10), host, strtoul(port, NULL, 10));
     else if (!strcmp(action, "task-save") && id[0] && name[0] &&
              enabled[0] && schedule[0] && interval[0] && max_runs[0] &&
-             timeout[0] && retry[0] && task_command[0])
+             timeout[0] && retry[0] &&
+             (normal_steps[0] || always_steps[0])) {
+        if ((normal_steps[0] && encode_step_lines(normal_steps) < 0) ||
+            (always_steps[0] && encode_step_lines(always_steps) < 0) ||
+            snprintf(command, sizeof(command),
+                     "UPSERTM\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                     id, name, enabled, schedule, interval, max_runs, timeout,
+                     retry, workdir[0] ? workdir : "/",
+                     normal_steps, always_steps) >= (int)sizeof(command)) {
+            printf("Status: 400 Bad Request\r\n"
+                   "Content-Type: application/json\r\n\r\n"
+                   "{\"error\":\"invalid task steps\"}\n");
+            return 0;
+        }
+    } else if (!strcmp(action, "task-save") && id[0] && name[0] &&
+               enabled[0] && schedule[0] && interval[0] && max_runs[0] &&
+               timeout[0] && retry[0] && task_command[0])
         snprintf(command, sizeof(command),
                  "UPSERT\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                  id, name, enabled, schedule, interval, max_runs, timeout,
@@ -263,30 +399,80 @@ static int cgi_main(void)
         unsigned int task_id, task_enabled, task_max_runs, task_timeout, task_retry;
         unsigned long long task_interval;
         size_t task_step_count;
+        int consumed = 0;
         char task_name[TSCHED_NAME_LEN], task_schedule[16];
-        char task_workdir[TSCHED_PATH_LEN], shell_command[TSCHED_COMMAND_LEN];
+        char task_workdir[TSCHED_PATH_LEN];
         char escaped_name[TSCHED_NAME_LEN * 2], escaped_dir[TSCHED_PATH_LEN * 2];
-        char escaped_command[TSCHED_COMMAND_LEN * 2];
         if (sscanf(response, "OK\t%u\t%63[^\t]\t%u\t%15[^\t]\t%llu\t"
-                   "%u\t%u\t%u\t%255[^\t]\t%zu\t%1023[^\n]",
+                   "%u\t%u\t%u\t%255[^\t]\t%zu\t%n",
                    &task_id, task_name, &task_enabled, task_schedule,
                    &task_interval, &task_max_runs, &task_timeout, &task_retry,
-                   task_workdir, &task_step_count, shell_command) != 11) {
+                   task_workdir, &task_step_count, &consumed) != 10 ||
+            consumed <= 0) {
             printf("{\"error\":\"invalid daemon response\"}\n");
         } else {
+            char *cursor = response + consumed;
+            int first_normal = 1;
+            int first_always = 1;
             json_escape(task_name, escaped_name, sizeof(escaped_name));
             json_escape(task_workdir, escaped_dir, sizeof(escaped_dir));
-            json_escape(shell_command, escaped_command, sizeof(escaped_command));
             printf("{\"id\":%u,\"name\":\"%s\",\"enabled\":%u,"
                    "\"schedule\":\"%s\",\"interval\":%llu,\"max_runs\":%u,"
                    "\"timeout\":%u,\"retry\":%u,\"workdir\":\"%s\","
-                   "\"step_count\":%zu,\"command\":\"%s\"}\n",
+                   "\"step_count\":%zu,\"steps\":[",
                    task_id, escaped_name, task_enabled, task_schedule,
                    task_interval, task_max_runs, task_timeout, task_retry,
-                   escaped_dir, task_step_count, escaped_command);
+                   escaped_dir, task_step_count);
+            while (*cursor && *cursor != '\n') {
+                char *separator = strchr(cursor, '\x1e');
+                char *end = separator ? separator : strchr(cursor, '\n');
+                char escaped_command[TSCHED_COMMAND_LEN * 2];
+                int always_run;
+                if (!end)
+                    end = cursor + strlen(cursor);
+                if (end > cursor + 2 && cursor[1] == ':') {
+                    char saved = *end;
+                    always_run = cursor[0] == '1';
+                    *end = '\0';
+                    json_escape(cursor + 2, escaped_command,
+                                sizeof(escaped_command));
+                    *end = saved;
+                    if (!always_run) {
+                        printf("%s\"%s\"", first_normal ? "" : ",",
+                               escaped_command);
+                        first_normal = 0;
+                    }
+                }
+                cursor = separator ? separator + 1U : end;
+                if (!separator)
+                    break;
+            }
+            printf("],\"always_steps\":[");
+            cursor = response + consumed;
+            while (*cursor && *cursor != '\n') {
+                char *separator = strchr(cursor, '\x1e');
+                char *end = separator ? separator : strchr(cursor, '\n');
+                char escaped_command[TSCHED_COMMAND_LEN * 2];
+                if (!end)
+                    end = cursor + strlen(cursor);
+                if (end > cursor + 2 && cursor[0] == '1' && cursor[1] == ':') {
+                    char saved = *end;
+                    *end = '\0';
+                    json_escape(cursor + 2, escaped_command,
+                                sizeof(escaped_command));
+                    *end = saved;
+                    printf("%s\"%s\"", first_always ? "" : ",",
+                           escaped_command);
+                    first_always = 0;
+                }
+                cursor = separator ? separator + 1U : end;
+                if (!separator)
+                    break;
+            }
+            printf("]}\n");
         }
     } else if (!strcmp(action, "log")) {
-        char escaped[16000];
+        char escaped[32768];
         const char *body = !strncmp(response, "OK\n", 3) ? response + 3 : response;
         json_escape(body, escaped, sizeof(escaped));
         printf("{\"log\":\"%s\"}\n", escaped);
@@ -302,6 +488,7 @@ int main(int argc, char **argv)
 {
     const char *socket_path = "/tmp/tsched.sock";
     const char *action;
+    unsigned long task_id = 0;
     char command[128];
     char response[TSCHED_IPC_RESPONSE_LEN];
     int index = 1;
@@ -324,16 +511,18 @@ int main(int argc, char **argv)
         snprintf(command, sizeof(command), "STOP\n");
     else if ((!strcmp(action, "run") || !strcmp(action, "cancel") ||
               !strcmp(action, "delete") || !strcmp(action, "log")) &&
-             index < argc)
+             index < argc && index + 1 == argc &&
+             parse_task_id(argv[index], &task_id) == 0)
         snprintf(command, sizeof(command), "%s %lu\n",
                  !strcmp(action, "run") ? "RUN" :
                  !strcmp(action, "cancel") ? "CANCEL" :
                  !strcmp(action, "delete") ? "DELETE" : "LOG",
-                 strtoul(argv[index], NULL, 10));
+                 task_id);
     else if ((!strcmp(action, "enable") || !strcmp(action, "disable")) &&
-             index < argc)
+             index < argc && index + 1 == argc &&
+             parse_task_id(argv[index], &task_id) == 0)
         snprintf(command, sizeof(command), "ENABLE %lu %d\n",
-                 strtoul(argv[index], NULL, 10),
+                 task_id,
                  !strcmp(action, "enable") ? 1 : 0);
     else {
         usage(argv[0]);
@@ -344,5 +533,5 @@ int main(int argc, char **argv)
         return 1;
     }
     fputs(response, stdout);
-    return 0;
+    return !strncmp(response, "OK", 2) ? 0 : 1;
 }

@@ -9,6 +9,8 @@ The V1 web/CGI interface supports task CRUD, enable/disable, manual execution,
 bounded latest-run logs, and persistent UDP log destination settings. Both
 task and global configuration use atomic replacement, CRC32 validation, and a
 backup fallback. Local logs have per-task and global tmpfs limits.
+Task output is never allowed to block the reactor: console mirroring is
+disabled by default and becomes non-blocking best effort when enabled.
 When the configured concurrency limit is reached, triggered tasks enter a
 fixed-capacity FIFO queue instead of polling; completion immediately releases
 the next task in trigger order.
@@ -63,6 +65,8 @@ later normal steps are skipped while every remaining `always_step` still runs.
 The first failure is retained as the task result, so a successful cleanup
 cannot hide a failed test. Shell state is not shared between steps. Background
 descendants are terminated before the scheduler advances to the next step.
+Steps receive `TSCHED_TASK_ID`, `TSCHED_TASK_NAME`, `TSCHED_RUN_ID`,
+`TSCHED_STEP_INDEX`, and `TSCHED_STEP_TYPE` environment variables.
 
 ## Limits
 

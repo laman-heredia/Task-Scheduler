@@ -18,7 +18,7 @@
 #define TSCHED_COMMAND_LEN 1024
 #define TSCHED_PATH_LEN 256
 #define TSCHED_MAX_CLIENTS 16
-#define TSCHED_IPC_REQUEST_LEN 2048
+#define TSCHED_IPC_REQUEST_LEN 32768
 #define TSCHED_IPC_RESPONSE_LEN 49152
 #define TSCHED_CONFIG_VERSION 1
 #define TSCHED_LOG_PATH_LEN 320
@@ -80,6 +80,7 @@ struct tsched_task {
     int terminating;
     enum tsched_stop_reason stop_reason;
     int group_draining;
+    int kill_sent;
     uint64_t terminate_at_ms;
     /* 逐步骤执行状态；next_step 指向下一条待判断的步骤。 */
     size_t next_step;
@@ -111,9 +112,14 @@ struct tsched_config {
     int udp_enabled;
     uint32_t max_running;
     uint32_t startup_jitter_ms;
+    uint32_t kill_grace_ms;
+    uint32_t retry_delay_ms;
     uint32_t local_log_kb;
     /* 所有本地任务日志的总上限；0 表示禁用本地日志。 */
     uint32_t local_log_total_kb;
+    uint32_t socket_mode;
+    /* 仅以非阻塞、尽力方式复制任务输出到守护进程 stdout。 */
+    int mirror_output;
 
     /* 任务按实际数量分配，避免空配置也预留数 MiB 内存。 */
     struct tsched_task *tasks;

@@ -10,6 +10,41 @@
 #include <time.h>
 #include <unistd.h>
 
+static void escape_field(const char *source, char *destination, size_t size)
+{
+    size_t used = 0;
+    while (source && *source && used + 1U < size) {
+        unsigned char character = (unsigned char)*source++;
+        const char *escape = NULL;
+        if (character == '\\')
+            escape = "\\\\";
+        else if (character == '"')
+            escape = "\\\"";
+        else if (character == '\n')
+            escape = "\\n";
+        else if (character == '\r')
+            escape = "\\r";
+        else if (character == '\t')
+            escape = "\\t";
+        if (escape) {
+            if (used + 2U >= size)
+                break;
+            destination[used++] = escape[0];
+            destination[used++] = escape[1];
+        } else if (character >= 0x20U && character < 0x7fU) {
+            destination[used++] = (char)character;
+        } else {
+            if (used + 4U >= size)
+                break;
+            destination[used++] = '\\';
+            destination[used++] = 'x';
+            destination[used++] = "0123456789abcdef"[character >> 4U];
+            destination[used++] = "0123456789abcdef"[character & 0x0fU];
+        }
+    }
+    destination[used] = '\0';
+}
+
 int tsched_udp_open(const struct tsched_config *config,
                     struct sockaddr_storage *address, socklen_t *address_len)
 {
@@ -44,16 +79,26 @@ void tsched_udp_send(int fd, const struct sockaddr_storage *address,
      * V1 采用尽力发送：不重传、不持久化，也不让日志故障阻塞调度器。
      */
     char packet[1200];
+    char escaped_name[TSCHED_NAME_LEN * 4U];
+    char escaped_message[900];
     struct timespec now;
     int length;
     if (fd < 0)
         return;
+    escape_field(task ? task->name : "daemon",
+                 escaped_name, sizeof(escaped_name));
+    escape_field(message ? message : "",
+                 escaped_message, sizeof(escaped_message));
     clock_gettime(CLOCK_REALTIME, &now);
     length = snprintf(packet, sizeof(packet),
-                      "TSCHED v=1 task=%u name=\"%s\" event=%s ts=%lld.%03ld msg=\"%s\"",
-                      task ? task->id : 0U, task ? task->name : "daemon", event,
+                      "TSCHED v=1 task=%u run=%u step=%zu name=\"%s\" "
+                      "event=%s ts=%lld.%03ld msg=\"%s\"",
+                      task ? task->id : 0U, task ? task->last_run_id : 0U,
+                      task && task->state == TSCHED_RUNNING ?
+                          task->active_step + 1U : 0U,
+                      escaped_name, event,
                       (long long)now.tv_sec, now.tv_nsec / 1000000L,
-                      message ? message : "");
+                      escaped_message);
     if (length < 0)
         return;
     if ((size_t)length >= sizeof(packet))

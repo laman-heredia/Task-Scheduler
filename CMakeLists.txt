@@ -30,12 +30,23 @@ add_test(NAME heap COMMAND test_heap)
 add_executable(test_config tests/test_config.c src/config.c src/util.c)
 add_test(NAME config COMMAND test_config)
 add_executable(test_ipc tests/test_ipc.c)
+add_executable(test_log tests/test_log.c src/log.c src/config.c src/util.c)
+add_test(NAME log COMMAND test_log)
 add_test(NAME integration
     COMMAND sh ${CMAKE_SOURCE_DIR}/tests/test_integration.sh
             $<TARGET_FILE:tschedd> $<TARGET_FILE:tschedctl>
             $<TARGET_FILE:test_ipc>)
 add_test(NAME capacity
     COMMAND sh ${CMAKE_SOURCE_DIR}/tests/test_capacity.sh
+            $<TARGET_FILE:tschedd> $<TARGET_FILE:tschedctl>)
+add_test(NAME timing
+    COMMAND sh ${CMAKE_SOURCE_DIR}/tests/test_timing.sh
+            $<TARGET_FILE:tschedd> $<TARGET_FILE:tschedctl>)
+add_test(NAME backpressure
+    COMMAND sh ${CMAKE_SOURCE_DIR}/tests/test_backpressure.sh
+            $<TARGET_FILE:tschedd> $<TARGET_FILE:test_ipc>)
+add_test(NAME output_backpressure
+    COMMAND sh ${CMAKE_SOURCE_DIR}/tests/test_output_backpressure.sh
             $<TARGET_FILE:tschedd> $<TARGET_FILE:tschedctl>)
 
 install(TARGETS tschedd tschedctl RUNTIME DESTINATION bin)

@@ -27,7 +27,11 @@ log_dir=$directory/logs
 max_running=1
 startup_jitter_ms=0
 local_log_kb=8
-local_log_total_kb=8
+local_log_total_kb=64
+kill_grace_ms=100
+retry_delay_ms=1000
+socket_mode=0660
+mirror_output=1
 udp_enabled=0
 udp_host=127.0.0.1
 udp_port=5514
@@ -140,6 +144,48 @@ timeout_ms=5000
 retry_count=2
 workdir=$directory
 step=printf 'attempt\n' >> disable-retry.log; sleep 0.2; exit 7
+
+[task:15]
+name=manual-max-runs
+enabled=1
+schedule=manual
+max_runs=1
+timeout_ms=5000
+workdir=$directory
+step=printf 'once\n' >> max-runs.log
+
+[task:16]
+name=retry-state
+enabled=1
+schedule=manual
+timeout_ms=5000
+retry_count=1
+workdir=$directory
+step=printf 'attempt\n' >> retry-state.log; [ "\$(wc -l < retry-state.log)" -gt 1 ]
+
+[task:17]
+name=pipe-backpressure
+enabled=1
+schedule=manual
+timeout_ms=10000
+step=dd if=/dev/zero bs=4096 count=256 2>/dev/null | tr '\\000' X; printf '\\nPIPE-DONE\\n'
+
+[task:18]
+name=runtime-context
+enabled=1
+schedule=manual
+timeout_ms=5000
+workdir=$directory
+step=printf '%s|%s|%s|%s|%s\\n' "\$TSCHED_TASK_ID" "\$TSCHED_TASK_NAME" "\$TSCHED_RUN_ID" "\$TSCHED_STEP_INDEX" "\$TSCHED_STEP_TYPE" > runtime-context.log
+always_step=printf '%s|%s\\n' "\$TSCHED_STEP_INDEX" "\$TSCHED_STEP_TYPE" >> runtime-context.log
+
+[task:19]
+name=binary-output
+enabled=1
+schedule=manual
+timeout_ms=5000
+step=printf 'before\\000\\377after\\n'
+
 EOF
 
 "$daemon" "$global" "$tasks" >"$output" 2>"$errors" &
@@ -151,6 +197,7 @@ while [ ! -S "$socket" ]; do
     [ "$i" -lt 50 ] || exit 1
     sleep 0.02
 done
+[ "$(stat -c '%a' "$socket")" = "660" ]
 
 "$ipc_test" "$socket"
 
@@ -320,6 +367,43 @@ done
 sleep 1.2
 [ "$(wc -l <"$directory/disable-retry.log")" -eq 1 ]
 
+"$client" -s "$socket" run 15 | grep -q 'OK started'
+i=0
+while ! "$client" -s "$socket" list |
+        awk -F '\t' '$1 == 15 && $5 == 1 { found=1 } END { exit !found }'; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.02
+done
+"$client" -s "$socket" run 15 | grep -q 'ERR max runs reached'
+[ "$(wc -l <"$directory/max-runs.log")" -eq 1 ]
+"$client" -s "$socket" disable 15 | grep -q 'OK saved'
+"$client" -s "$socket" enable 15 | grep -q 'OK saved'
+"$client" -s "$socket" run 15 | grep -q 'OK started'
+i=0
+while [ "$(wc -l <"$directory/max-runs.log")" -lt 2 ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.01
+done
+
+"$client" -s "$socket" run 16 | grep -q 'OK started'
+i=0
+while ! "$client" -s "$socket" list |
+        awk -F '\t' '$1 == 16 && $4 == 3 { found=1 } END { exit !found }'; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.02
+done
+i=0
+while ! "$client" -s "$socket" list |
+        awk -F '\t' '$1 == 16 && $5 == 1 && $7 == 0 { found=1 } END { exit !found }'; do
+    i=$((i + 1))
+    [ "$i" -lt 150 ] || exit 1
+    sleep 0.02
+done
+[ "$(wc -l <"$directory/retry-state.log")" -eq 2 ]
+
 GATEWAY_INTERFACE=CGI/1.1 TSCHED_SOCKET="$socket" \
 QUERY_STRING='action=task-save&id=2&name=web-task&enabled=0&schedule=manual&interval=0&max_runs=0&timeout=5000&retry=0&workdir=%2Ftmp&command=printf%20web-created' \
 "$client" | grep -q 'OK saved'
@@ -331,7 +415,26 @@ QUERY_STRING='action=task&id=2' "$client" | grep -q '"name":"web-task"'
 sleep 0.1
 grep -q 'web-created' "$directory/logs/task-2.log"
 [ "$(find "$directory/logs" -type f -name 'task-*.log' -exec wc -c {} + |
-     awk 'END { print $1 }')" -le 8192 ]
+     awk 'END { print $1 }')" -le 65536 ]
+"$client" -s "$socket" delete 2 | grep -q 'OK deleted'
+
+GATEWAY_INTERFACE=CGI/1.1 TSCHED_SOCKET="$socket" \
+QUERY_STRING='action=task-save&id=2&name=web-multi&enabled=1&schedule=manual&interval=0&max_runs=0&timeout=5000&retry=0&workdir='"$directory"'&steps=printf%20%27one%5Cn%27%20%3E%3E%20web-multi.log%0Afalse%0Aprintf%20%27skipped%5Cn%27%20%3E%3E%20web-multi.log&always_steps=printf%20%27cleanup%5Cn%27%20%3E%3E%20web-multi.log' \
+"$client" | grep -q 'OK saved'
+GATEWAY_INTERFACE=CGI/1.1 TSCHED_SOCKET="$socket" \
+QUERY_STRING='action=task&id=2' "$client" |
+    grep -q '"steps":\["printf.*one.*","false","printf.*skipped.*"\],"always_steps":\["printf.*cleanup.*"\]'
+"$client" -s "$socket" run 2 | grep -q 'OK started'
+i=0
+while [ ! -f "$directory/web-multi.log" ] ||
+      ! grep -q cleanup "$directory/web-multi.log"; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.02
+done
+grep -q '^one$' "$directory/web-multi.log"
+grep -q '^cleanup$' "$directory/web-multi.log"
+! grep -q skipped "$directory/web-multi.log"
 "$client" -s "$socket" delete 2 | grep -q 'OK deleted'
 
 GATEWAY_INTERFACE=CGI/1.1 TSCHED_SOCKET="$socket" \
@@ -343,7 +446,7 @@ QUERY_STRING='action=task-save&id=3&name=cancel-task&enabled=1&schedule=manual&i
 i=0
 while ! "$client" -s "$socket" delete 3 | grep -q 'OK deleted'; do
     i=$((i + 1))
-    [ "$i" -lt 50 ] || exit 1
+    [ "$i" -lt 250 ] || exit 1
     sleep 0.02
 done
 
@@ -352,6 +455,42 @@ QUERY_STRING='action=config-save&enabled=1&host=127.0.0.1&port=5515' \
 "$client" | grep -q 'OK saved'
 grep -q '^udp_enabled=1$' "$global"
 grep -q '^udp_port=5515$' "$global"
+
+"$client" -s "$socket" run 17 | grep -q 'OK started'
+i=0
+while ! grep -q 'PIPE-DONE' "$output"; do
+    i=$((i + 1))
+    [ "$i" -lt 250 ] || exit 1
+    sleep 0.02
+done
+"$client" -s "$socket" list |
+    awk -F '\t' '$1 == 17 && $5 == 1 && $7 == 0 { found=1 } END { exit !found }'
+
+"$client" -s "$socket" run 18 | grep -q 'OK started'
+i=0
+while [ ! -s "$directory/runtime-context.log" ] ||
+      [ "$(wc -l <"$directory/runtime-context.log")" -lt 2 ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.02
+done
+grep -Eq '^18\\|runtime-context\\|[1-9][0-9]*\\|1\\|normal$' \
+    "$directory/runtime-context.log"
+grep -q '^2|always$' "$directory/runtime-context.log"
+
+"$client" -s "$socket" run 19 | grep -q 'OK started'
+i=0
+while ! "$client" -s "$socket" list |
+        awk -F '\t' '$1 == 19 && $5 == 1 { found=1 } END { exit !found }'; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.02
+done
+binary_json=$(GATEWAY_INTERFACE=CGI/1.1 TSCHED_SOCKET="$socket" \
+    QUERY_STRING='action=log&id=19' "$client")
+printf '%s' "$binary_json" | grep -Fq 'before\\x00\\xffafter'
+printf '%s' "$binary_json" | sed '1,/^\r$/d' | python3 -c \
+    'import json,sys; json.load(sys.stdin)'
 
 "$client" -s "$socket" run 6 | grep -q 'OK started'
 i=0
